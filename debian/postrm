@@ -1,0 +1,65 @@
+#!/bin/sh
+# debian/postrm
+# On removal/purge, stop+disable the system service and undo machine policy the
+# daemon may have written:
+#   - apt hook
+#   - .deb MIME default (restore the prior handler so double-click isn't broken)
+# Restore happens on BOTH remove and purge; purge also drops state and config.
+
+set -e
+
+SYS_MIME=/etc/xdg/mimeapps.list
+STATE=/var/lib/ghost-sentri
+HOOK=/etc/apt/apt.conf.d/99ghost-sentri
+SHIM_BIN=/usr/libexec/ghost-sentri-dpkg-shim
+SHIM_LINK=/usr/local/sbin/dpkg
+
+# Remove the local-.deb PATH-shim, but ONLY if /usr/local/sbin/dpkg is our own
+# symlink — never disturb a foreign dpkg override an admin may have placed there.
+# Backstop to the daemon's own disable; runs even if the daemon never did.
+remove_dpkg_shim() {
+    if [ -L "$SHIM_LINK" ] && [ "$(readlink "$SHIM_LINK")" = "$SHIM_BIN" ]; then
+        rm -f "$SHIM_LINK"
+    fi
+}
+
+stop_service() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now ghost-sentri-daemon.service 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+}
+
+restore_mime() {
+    if [ -e "$STATE/mimeapps.gs-backup" ]; then
+        cp -a "$STATE/mimeapps.gs-backup" "$SYS_MIME" 2>/dev/null || true
+    elif [ -e "$STATE/mimeapps.gs-created" ]; then
+        # We created the file; there was no prior one — remove it.
+        rm -f "$SYS_MIME"
+    fi
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database /usr/share/applications 2>/dev/null || true
+    fi
+}
+
+case "$1" in
+    remove)
+        stop_service
+        rm -f "$HOOK"
+        remove_dpkg_shim
+        restore_mime
+        ;;
+    purge)
+        stop_service
+        rm -f "$HOOK"
+        remove_dpkg_shim
+        restore_mime
+        rm -rf "$STATE"
+        rm -rf /etc/ghost-sentri
+        ;;
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+esac
+
+#DEBHELPER#
+exit 0

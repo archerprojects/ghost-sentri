@@ -1,0 +1,43 @@
+# daemon/Cargo.toml
+# ghost-sentri-daemon (resident, headless) + ghost-sentri-installer (privileged worker).
+# No GTK, no relm4. No zbus / futures-util (no D-Bus backend in the build).
+
+[package]
+name = "ghost-sentri-daemon"
+version = "1.0.0"
+edition = "2021"
+description = "Ghost Sentri resident intercept daemon and privileged install worker."
+license = "GPL-3.0-only"
+
+# Resident daemon (default binary).
+[[bin]]
+name = "ghost-sentri-daemon"
+path = "src/main.rs"
+
+# Privileged install worker (pkexec'd on demand).
+[[bin]]
+name = "ghost-sentri-installer"
+path = "src/bin/ghost-sentri-installer.rs"
+
+# Local .deb PATH-shim (installed at /usr/local/sbin/dpkg when the apt monitor is
+# armed). Delegates to --apt-hook; fails open to /usr/bin/dpkg.
+[[bin]]
+name = "ghost-sentri-dpkg-shim"
+path = "src/bin/ghost-sentri-dpkg-shim.rs"
+
+[dependencies]
+ghost-sentri-core = { path = "../core" }
+
+# multi-thread runtime (2 workers, see main.rs): socket I/O + occasional subprocess.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "process", "fs", "time"] }
+async-trait = "0.1"
+ksni        = "0.2"
+notify      = "6"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+anyhow      = "1"
+dirs        = "5"
+log         = "0.4"
+env_logger  = "0.11"
+# polkit CheckAuthorization over the system bus (also pulled transitively by ksni).
+dbus        = "0.9"

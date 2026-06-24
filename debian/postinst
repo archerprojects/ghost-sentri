@@ -1,0 +1,51 @@
+#!/bin/sh
+# debian/postinst
+# Ghost Sentri runs as a ROOT systemd system service. The service starts at
+# install and stays up, but it is INERT — no .deb handler, no apt hook, no
+# monitors — until the user enables scanners from the dashboard. Enabling fires
+# the daemon's polkit-authorised in-process apply (the SOLE writer of machine
+# policy: /etc/ghost-sentri/config.toml, the apt hook, the .deb MIME default).
+
+set -e
+
+case "$1" in
+    configure)
+        # Machine config directory (root-owned policy, written by the daemon).
+        mkdir -p /etc/ghost-sentri
+        chmod 0755 /etc/ghost-sentri
+
+        # State dir (mimeapps backup markers) and audit log dir.
+        mkdir -p /var/lib/ghost-sentri
+        mkdir -p /var/log/ghost-sentri
+        chown root:root /var/log/ghost-sentri
+        chmod 0755 /var/log/ghost-sentri
+
+        if command -v update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database /usr/share/applications 2>/dev/null || true
+        fi
+
+        # Icon caches — lean-icons line is non-fatal on non-Lean systems.
+        gtk-update-icon-cache -f -t /usr/share/icons/hicolor   2>/dev/null || true
+        gtk-update-icon-cache -f -t /usr/share/icons/lean-icons 2>/dev/null || true
+
+        # Enable + (re)start the root system service. restart — not just
+        # enable --now — guarantees a rebuilt/upgraded binary replaces the
+        # already-running daemon; enable --now leaves an existing daemon running
+        # the OLD binary, which silently ships stale code on every reinstall.
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload 2>/dev/null || true
+            systemctl enable ghost-sentri-daemon.service 2>/dev/null || true
+            systemctl restart ghost-sentri-daemon.service 2>/dev/null || true
+        fi
+
+        echo "  Ghost Sentri installed and running (inert)."
+        echo "  Open the dashboard, enable the scanners you want on the Settings tab"
+        echo "  and Confirm — changes apply system-wide and take effect immediately."
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+esac
+
+#DEBHELPER#
+exit 0

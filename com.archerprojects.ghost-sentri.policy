@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+    "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+    "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+
+<policyconfig>
+
+  <vendor>Archer Projects</vendor>
+  <vendor_url>https://github.com/archerprojects/Ghost-Sentri</vendor_url>
+
+  <!--
+    pkexec uses org.freedesktop.policykit.exec and matches the program being run
+    against the exec.path annotation below to choose this action's message. The
+    privileged worker (ghost-sentri-installer) is the pkexec target; once it holds
+    root it performs the scan AND the apt install under this single prompt, so the
+    user authorizes once with a clean message.
+  -->
+  <action id="com.archerprojects.ghost-sentri.install">
+    <description>Install Package</description>
+    <message>Authorization is Required to Install this Package.</message>
+    <icon_name>ghost-sentri</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/ghost-sentri-installer</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+  <!--
+    The root system daemon authorises control-socket callers for this action via
+    org.freedesktop.PolicyKit1.Authority.CheckAuthorization (no pkexec). It gates
+    machine-policy changes: enabling/disabling monitors and updating virus
+    definitions. auth_admin (no keep) so every Confirm authorises fresh — no
+    silent cached applies; one Confirm = one prompt covering that whole batch.
+  -->
+  <action id="com.archerprojects.ghost-sentri.manage">
+    <description>Manage Ghost Sentri protection</description>
+    <message>Authorization is required to change Ghost Sentri protection settings.</message>
+    <icon_name>ghost-sentri</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+
+</policyconfig>

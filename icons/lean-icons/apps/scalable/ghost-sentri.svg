@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Ghost Sentri — crosshair icon -->
+  <!-- Outer ring -->
+  <circle cx="256" cy="256" r="230" fill="none" stroke="#cc0000" stroke-width="36"/>
+
+  <!-- Horizontal bar — left and right of centre gap -->
+  <line x1="26"  y1="256" x2="176" y2="256" stroke="#cc0000" stroke-width="28" stroke-linecap="round"/>
+  <line x1="336" y1="256" x2="486" y2="256" stroke="#cc0000" stroke-width="28" stroke-linecap="round"/>
+
+  <!-- Vertical bar — top and bottom of centre gap -->
+  <line x1="256" y1="26"  x2="256" y2="176" stroke="#cc0000" stroke-width="28" stroke-linecap="round"/>
+  <line x1="256" y1="336" x2="256" y2="486" stroke="#cc0000" stroke-width="28" stroke-linecap="round"/>
+
+  <!-- Horizontal tick marks -->
+  <line x1="120" y1="242" x2="120" y2="270" stroke="#cc0000" stroke-width="18" stroke-linecap="round"/>
+  <line x1="155" y1="242" x2="155" y2="270" stroke="#cc0000" stroke-width="18" stroke-linecap="round"/>
+  <line x1="357" y1="242" x2="357" y2="270" stroke="#cc0000" stroke-width="18" stroke-linecap="round"/>
+  <line x1="392" y1="242" x2="392" y2="270" stroke="#cc0000" stroke-width="18" stroke-linecap="round"/>
+
+  <!-- Vertical tick marks -->
+  <line x1="242" y1="120" x2="270" y2="120" stroke="#cc0000" stroke-width="18" stroke-linecap="round"/>
+  <line x1="242" y1="155" x2="270" y2="155" stroke="#cc0000" stroke-width="18" stroke-linecap="round"/>
+  <line x1="242" y1="357" x2="270" y2="357" stroke="#cc0000" stroke-width="18" stroke-linecap="round"/>
+  <line x1="242" y1="392" x2="270" y2="392" stroke="#cc0000" stroke-width="18" stroke-linecap="round"/>
+</svg>

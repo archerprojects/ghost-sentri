@@ -1,0 +1,21 @@
+# /usr/share/ghost-sentri/99ghost-sentri  (TEMPLATE)
+# Ghost Sentri APT pre-install hook.
+#
+# This file is a TEMPLATE. It is NOT active until the user enables the
+# "Packaged Apps" monitor in Ghost Sentri, at which point the daemon copies it
+# to /etc/apt/apt.conf.d/99ghost-sentri (and removes it on disable).
+#
+# When active, it fires before dpkg installs any apt-downloaded package. The
+# hook process connects to the running daemon, which decides proceed/cancel via
+# the GUI. If the daemon is not running, the hook exits 0 (allows the install).
+#
+# The invocation is GUARDED: if the daemon binary is absent (e.g. Ghost Sentri
+# was removed but this file was orphaned, or removal is mid-transaction), the
+# hook is a silent no-op and apt proceeds normally. A bare invocation here would
+# make a missing binary abort EVERY apt operation — including the very removal
+# that deletes it — so the guard is mandatory, not cosmetic.
+#
+# Manual disable without uninstalling:
+#   sudo rm -f /etc/apt/apt.conf.d/99ghost-sentri
+
+DPkg::Pre-Install-Pkgs { "if [ -x /usr/libexec/ghost-sentri-daemon ]; then /usr/libexec/ghost-sentri-daemon --apt-hook; fi"; };

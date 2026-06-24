@@ -1,0 +1,26 @@
+# Cargo.toml — workspace root — v1.0
+# Ghost Sentri v2.0 — split workspace.
+#
+# Members are added one stage at a time so each stage builds green in isolation:
+#   Stage 1 (this drop):  core
+#   Stage 2:              + daemon  (incl. the ghost-sentri-installer worker bin)
+#   Stage 3:              + gui
+#
+# To audit a stage:  cargo check -p ghost-sentri-core   (then -p ...-daemon, -p ...-gui)
+
+[workspace]
+resolver = "2"
+members  = [
+    "core",
+    "daemon",
+    "gui",
+]
+
+# Shared release profile — applied to every member crate.
+# Tuned for a small, long-resident daemon: thin codegen, no unwind tables.
+[profile.release]
+opt-level     = "s"
+lto           = true
+codegen-units = 1
+strip         = true
+panic         = "abort"

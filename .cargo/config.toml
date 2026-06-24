@@ -1,0 +1,21 @@
+# .cargo/config.toml
+# Flatpak builds require offline vendor mode — all crates must be vendored
+# into a vendor/ directory before the Flatpak sandbox cuts network access.
+#
+# For .deb native builds: this file is ignored (no [source] override active)
+# For Flatpak builds: uncomment the [source] section and run `cargo vendor` first
+#
+# To prepare for a Flatpak build:
+#   cargo vendor
+#   # Then uncomment the [source] block below
+#   # Then commit vendor/ and this file to the repo
+
+# [source.crates-io]
+# replace-with = "vendored-sources"
+#
+# [source.vendored-sources]
+# directory = "vendor"
+
+[build]
+# Target native CPU for .deb builds — remove for cross-compilation
+# rustflags = ["-C", "target-cpu=native"]

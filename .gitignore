@@ -1,0 +1,23 @@
+# ── Rust / Cargo ──────────────────────────────────────────────
+/target
+**/target
+# Cargo.lock IS tracked — this is an application, not a library.
+
+# ── Build pipeline artifacts (build.sh) ──────────────────────
+/dist
+/.deb-staging
+/.build_counter
+
+# ── Flatpak offline vendor (see .cargo/config.toml) ──────────
+/vendor
+
+# ── Editor / OS noise ────────────────────────────────────────
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# ── Stray build output / cargo-fix backups ──────────────────
+*.deb
+*.rs.bk

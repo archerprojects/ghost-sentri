@@ -1,0 +1,19 @@
+[Unit]
+Description=Ghost Sentri security monitor (system daemon)
+Documentation=https://github.com/archerprojects/Ghost-Sentri
+After=dbus.service polkit.service local-fs.target
+Wants=polkit.service
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/ghost-sentri-daemon
+Restart=on-failure
+RestartSec=3
+# /run/ghost-sentri for the control + hook sockets; 0755 so users can traverse
+# in to connect (the socket itself is relaxed to 0666 by the daemon and gated
+# per-request by polkit).
+RuntimeDirectory=ghost-sentri
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Ghost Sentri
+GenericName=Security Monitor
+Comment=Install interceptor and ClamAV security monitor
+Exec=ghost-sentri %f
+Icon=ghost-sentri
+Terminal=false
+Type=Application
+Categories=X-LEAN-Admin;X-LEAN-Security;System;Security;
+MimeType=application/vnd.debian.binary-package;
+Keywords=security;antivirus;clamav;monitor;firewall;
+StartupNotify=false
