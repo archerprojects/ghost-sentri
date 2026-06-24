@@ -6,14 +6,21 @@ at the dpkg level (terminal apt and file-manager double-click), scans them with
 ClamAV before they reach the system, and keeps a machine-wide audit trail of
 what was installed.
 
-## Developer
+---
+
+**Developer**
 
 ```
 Developed for Lean Linux by:
-Developer:  archerprojects
-Maintainer: archerprojects <archer.projects@proton.me>
-https://github.com/archerprojects/Ghost-Sentri
+archerprojects
+archer.projects@proton.me
+https://github.com/archerprojects/ghost-sentri
 ```
+
+Developed for Lean Linux. Not exclusive to Lean Linux — runs on any standard
+Linux desktop.
+
+---
 
 ## Screenshots
 
@@ -22,6 +29,8 @@ https://github.com/archerprojects/Ghost-Sentri
 | ![Welcome](screenshots/GS_1.jpg) | ![Dashboard](screenshots/GS_2.jpg) | ![Settings](screenshots/GS_3.jpg) |
 
 *First-run welcome, the read-only status Dashboard, and the monitor toggle grid in Settings.*
+
+---
 
 ## Architecture
 
@@ -71,6 +80,8 @@ the config, the apt hook, the `.deb` MIME default, and the autostart entry.
   records their installs rather than blocking them; the dedicated installer
   performs the install.
 
+---
+
 ## Prerequisites
 
 - **ClamAV** — `clamav` and `clamav-base` ((GS) shells out to
@@ -82,12 +93,16 @@ the config, the apt hook, the `.deb` MIME default, and the autostart entry.
 
 Runtime dependencies are declared authoritatively in `debian/control`.
 
+---
+
 ## Compatibility
 
 Built and tested against Linux Mint 21–22 / Ubuntu 24.04 (GTK4 + libadwaita),
 packaged as a native `.deb`. The interceptor backends are apt/dpkg-based today;
 the privileged `--apply` path is structured by role so `dnf`/`pacman` support
 can slot in later — multi-distro is on the roadmap, not in this build.
+
+---
 
 ## Building
 
@@ -99,6 +114,10 @@ Produces `dist/ghost-sentri_<version>_amd64.deb`. The version is
 `MAJOR.MINOR` from `gui/Cargo.toml` plus a build-counter patch, stamped back into
 `gui/Cargo.toml` so the About/welcome version always matches the `.deb`.
 
+---
+
 ## License
 
 GPL-3.0-only. See [`COPYING`](./COPYING).
+
+Copyright (C) 2026 archerprojects (archer.projects@proton.me)
