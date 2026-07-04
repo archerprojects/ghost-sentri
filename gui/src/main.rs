@@ -13,7 +13,7 @@ mod control;
 mod installer;
 
 use chrono::Local;
-use ghost_sentri_core::clam::{DefinitionStatus, ScanResult, SystemClamBackend, ThreatDetail};
+use ghost_sentri_core::clam::{DefinitionStatus, ScanResult, SystemClamBackend};
 use ghost_sentri_core::config::Config;
 use ghost_sentri_core::protocol::{ControlEvent, ControlRequest};
 use ghost_sentri_core::quarantine::QuarantineRecord;

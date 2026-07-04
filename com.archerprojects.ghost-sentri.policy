@@ -6,7 +6,7 @@
 <policyconfig>
 
   <vendor>Archer Projects</vendor>
-  <vendor_url>https://github.com/archerprojects/Ghost-Sentri</vendor_url>
+  <vendor_url>https://github.com/archerprojects/ghost-sentri</vendor_url>
 
   <!--
     pkexec uses org.freedesktop.policykit.exec and matches the program being run

@@ -23,7 +23,7 @@ pub use deb_inspect::{
     RuleFamily, RiskBand, inspect as inspect_deb,
 };
 pub use config::{
-    BackendConfig, Config, DefinitionConfig, LogConfig, LogVerbosity, QuarantineConfig,
+    BackendConfig, Config, DefinitionConfig, QuarantineConfig,
     ScanConfig, SentryConfig,
 };
 pub use clam::{

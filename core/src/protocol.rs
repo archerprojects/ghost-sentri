@@ -3,15 +3,18 @@
 //
 // There are THREE channels, at two trust levels:
 //
-//   1. hook.sock   (root-reachable, /tmp/ghost-sentri/hook.sock)
+//   1. hook.sock   (root-reachable, /run/ghost-sentri/hook.sock)
 //        The apt pre-install hook (running as root) connects here and BLOCKS
 //        until the daemon returns a decision. Narrow: install decisions only.
 //        Wire form is hand-built JSON (see daemon/src/backends/apt.rs), not a
 //        typed enum here.
 //
-//   2. control.sock (user-only, $XDG_RUNTIME_DIR/ghost-sentri/control.sock, 0600)
-//        The on-demand dashboard GUI connects here. The daemon is the single
-//        source of truth; the GUI is a viewer/controller.
+//   2. control.sock (/run/ghost-sentri/control.sock)
+//        The on-demand dashboard GUI connects here. The socket is world-
+//        connectable (0666, relaxed by the root daemon); it is NOT protected by
+//        file permissions — every privileged ControlRequest is gated per-call by
+//        polkit (see daemon/src/polkit.rs). The daemon is the single source of
+//        truth; the GUI is a viewer/controller.
 //        Types: ControlRequest / ControlEvent.
 //
 //   3. worker stdio (no socket — pkexec pipes)
@@ -20,9 +23,7 @@
 //        JSON. The worker holds root for the whole sequence (scan + install + audit
 //        log). Types: WorkerInbound (GUI->worker) / WorkerOutbound (worker->GUI).
 //
-// All enums serialize as {"type":"<snake_case>", ...fields} so they match the
-// hand-built JSON the pre-split code already puts on the wire. Stage 2/3 migrate
-// the ported daemon/installer code onto these typed (de)serializers.
+// All enums serialize as {"type":"<snake_case>", ...fields}.
 
 use serde::{Deserialize, Serialize};
 

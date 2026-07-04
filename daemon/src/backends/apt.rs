@@ -181,10 +181,13 @@ pub async fn apt_hook_main(socket_path: &PathBuf) -> i32 {
         return 0;
     }
 
-    // Belt-and-braces: auto-approve a transaction that is Ghost Sentri itself.
-    if paths.iter().all(|p| p.contains("ghost-sentri")) {
-        return 0;
-    }
+    // NOTE: no path-name self-approve here. GS_HOOK_BYPASS (checked above) is the
+    // ONLY self-bypass — it's set by our own worker on our own apt transaction and
+    // is not forgeable by a package. A name/path substring match ("ghost-sentri" in
+    // the path) WAS a spoofable hole: any .deb named or placed to contain that string
+    // skipped the scan. Scanning a genuine GS self-upgrade costs a few seconds and is
+    // harmless, so the check is gone rather than made "smarter" (any name test stays
+    // spoofable).
 
     match tokio::net::UnixStream::connect(socket_path).await {
         Ok(mut stream) => {

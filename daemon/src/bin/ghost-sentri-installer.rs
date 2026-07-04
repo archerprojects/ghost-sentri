@@ -18,8 +18,10 @@
 // (root-owned — this is the one process that holds root during an install, which
 // is exactly why the audit write lives here and not in the unprivileged daemon).
 //
-// UNTESTED end-to-end in this build (no GUI driver yet — that is stage 3). The
-// scan/install/log logic is exercised by piping a Choice on stdin; see README.
+// Fail-closed: a scan ERROR (package could not be scanned — extraction failure,
+// bomb fault, clamscan unavailable) BLOCKS the install, matching the apt-hook
+// path's `unscannable` hard-block. Only an explicit Install-Without-Scan choice
+// bypasses the scan, and it is recorded as such.
 
 use std::io::{BufRead, Write};
 use std::process::{Command, Stdio};
@@ -116,9 +118,23 @@ fn run(mode: WorkerMode, path: &str) -> i32 {
                     }
                 }
                 ScanResult::Error(e) => {
-                    // Fail-open on scan error, matching prior behavior, but record it.
+                    // Fail CLOSED. A scan error means ClamAV could not vouch for this
+                    // package (e.g. it could not be extracted to scan, or a bomb
+                    // faulted the fence) — that is NOT clean and must not install. This
+                    // matches the apt-hook path, which hard-blocks `unscannable`.
+                    // Blocking here rather than a silent pass closes the gap where the
+                    // same package installed via double-click but was blocked via apt.
+                    // A user who still wants it can re-run and choose Install Without
+                    // Scan explicitly — an informed override, never an automatic one.
                     emit(&WorkerOutbound::ScanError { message: e.clone() });
-                    finish(mode, avenue, &user, path, package.as_deref(), ScanOutcome::Error { message: e })
+                    audit(&user, avenue, Action::Cancelled, path, package.as_deref(),
+                          Some(ScanOutcome::Error { message: e }), Some("blocked — unscannable (fail-closed)"));
+                    emit(&WorkerOutbound::Done {
+                        approved: false,
+                        installed: false,
+                        message: "Blocked — package could not be scanned".into(),
+                    });
+                    1
                 }
             }
         }

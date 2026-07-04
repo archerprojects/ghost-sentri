@@ -19,10 +19,9 @@ pub mod wrapper;
 use anyhow::Result;
 use async_trait::async_trait;
 use ghost_sentri_core::config::Config;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -204,31 +203,6 @@ impl InterceptEvent {
 
     #[allow(dead_code)] // used by the dashboard's bulk-install view (stage 3)
     pub fn is_bulk(&self) -> bool { !self.bulk_paths.is_empty() }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// DedupeGuard
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[derive(Clone)]
-pub struct DedupeGuard {
-    seen: Arc<Mutex<HashSet<PathBuf>>>,
-}
-
-impl DedupeGuard {
-    pub fn new() -> Self {
-        Self { seen: Arc::new(Mutex::new(HashSet::new())) }
-    }
-    pub fn check(&self, path: &Path) -> bool {
-        self.seen.lock().unwrap().insert(path.to_path_buf())
-    }
-    pub fn release(&self, path: &Path) {
-        self.seen.lock().unwrap().remove(path);
-    }
-}
-
-impl Default for DedupeGuard {
-    fn default() -> Self { Self::new() }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -5,7 +5,7 @@
 
 [package]
 name = "ghost-sentri-gui"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Ghost Sentri dashboard and installer UI."
 license = "GPL-3.0-only"

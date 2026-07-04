@@ -1,8 +1,13 @@
 // core/src/clam/mod.rs
 // Scan engine: system `clamscan` subprocess (no C FFI).
 // Definition status: filesystem stat of daily.cvd/.cld mtime — no network calls.
-// Definition updates: run via pkexec freshclam, user-initiated only (polkit auth).
-// Staleness is checked daily by the resident daemon (no systemd timer).
+// Definition updates: the root system daemon runs `freshclam` directly after a
+// per-request polkit authorisation (no pkexec) — user-initiated only, never silent.
+// Staleness is checked daily by the resident daemon (in-process interval, no timer).
+//
+// `.deb` scans route through a size-capped loopback image (the decompression-bomb
+// fence, see LoopMount); `sweep_stale_scratch()` closes any fence debris a crash
+// leaked and is called once at daemon start.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -215,62 +220,84 @@ impl SystemClamBackend {
     /// caller treats as a hard block — never a pass.
     fn scan_deb(&self, path: &Path) -> ScanResult {
         let base = scan_tempdir_base();
-        let need = deb_installed_bytes(path);
         let free = fs_available_bytes(&base);
-        let fits = matches!((need, free), (Some(n), Some(f)) if f >= n.saturating_mul(SPACE_MARGIN));
+        let need = deb_installed_bytes(path);
+        let cap  = loop_cap(free);
 
         // `disk_pressure` shapes the user-facing message if the scan ultimately
-        // can't run: true means space was the reason we avoided / couldn't finish
-        // the extract.
-        let mut disk_pressure = !fits;
+        // can't run: true means the capped scratch was unavailable or filled.
+        let mut disk_pressure = false;
 
-        if fits {
-            match self.scan_deb_extracted(path, &base) {
-                Ok(ScanResult::Error(e)) => return ScanResult::Error(unscannable_msg(path, false, &e)),
-                Ok(other) => return other,        // scanned in a single DB load
-                Err(()) => disk_pressure = true,  // ENOSPC mid-write → fall back, partial cleaned
+        match cap {
+            // A capped image is available and the package's HONEST declared size
+            // plausibly fits it. A lying-small bomb also passes this test — and is
+            // then physically contained by the image, which is the whole point.
+            Some(cap) if need.map_or(true, |n| n <= cap) => {
+                match self.scan_deb_extracted(path, &base, cap) {
+                    Ok(ScanResult::Error(e)) => return ScanResult::Error(unscannable_msg(path, false, &e)),
+                    Ok(other) => return other,        // scanned in a single DB load
+                    Err(()) => disk_pressure = true,  // couldn't provision / image ENOSPC → stream, partial wiped
+                }
             }
+            // Honest package larger than the cap → skip the wasted partial extract
+            // and stream directly (no disk pressure — streaming is the right tool).
+            Some(_) => {}
+            // No capped image at all (free space unknown or below the floor).
+            None => disk_pressure = true,
         }
 
         match self.scan_deb_streamed(path) {
-            ScanResult::Error(e) => ScanResult::Error(unscannable_msg(path, disk_pressure, &e)),
+            // A contained bomb faults the capped image (disk_pressure=true), then
+            // trips the streaming scan fence and returns the limits-exceeded error.
+            // Its own wording is the honest one: the cap ceilings at LOOP_CAP_CEILING,
+            // so "free space and retry" is a lie — freeing space never lifts the fence.
+            // The streaming error text wins whenever it carried the limits trip; only
+            // a genuine provisioning-for-space failure keeps the disk-pressure wording.
+            ScanResult::Error(e) => {
+                let space = disk_pressure && !e.contains("exceeded scan limits");
+                ScanResult::Error(unscannable_msg(path, space, &e))
+            }
             other => other,
         }
     }
 
-    /// Fast path: raw-extract the WHOLE package tree (payload + control scripts
-    /// under `DEBIAN/`) and run ONE recursive clamscan over it. Scanning the
-    /// extracted members as individual files — rather than handing clamscan the
-    /// `data.tar` as one container — means the per-container `--max-scansize` never
-    /// aggregates across a package of many small files (the common false-skip on
-    /// large multi-file packages). dpkg-deb does the decompression, so this never
-    /// depends on clamscan's own compression support. Returns `Err(())` only when
-    /// the extract fails (incl. ENOSPC → fall back, guard wipes the partial); a
-    /// clamscan launch/run failure is surfaced as `Ok(ScanResult::Error)` because
-    /// streaming would fail the same way.
-    fn scan_deb_extracted(&self, path: &Path, base: &Path) -> Result<ScanResult, ()> {
-        let dir = make_scan_dir(base).ok_or(())?;
-        let _guard = TempDirGuard(dir.clone()); // rm -rf on return — self-healing, no partial left
+    /// Fast path: extract the WHOLE package tree (payload + control scripts under
+    /// `DEBIAN/`) into a SIZE-CAPPED loopback image and run ONE recursive clamscan
+    /// over it. Scanning the extracted members as individual files — rather than
+    /// handing clamscan the `data.tar` as one container — means the per-container
+    /// `--max-scansize` never aggregates across a package of many small files (the
+    /// common false-skip on large multi-file packages). dpkg-deb does the
+    /// decompression, so this never depends on clamscan's own compression support.
+    ///
+    /// The capped image is the decompression-bomb disk fence: extraction (and
+    /// clamscan's own descent temps, pinned to the same dir) can write at most
+    /// `cap` bytes before the image ENOSPC-es. That fault returns `Err(())` exactly
+    /// like any other extract failure, so a bomb routes to the streaming fallback
+    /// while the host root filesystem never fills. Provisioning failure (no mkfs,
+    /// no mount privilege, loop devices exhausted) also returns `Err(())` → stream.
+    fn scan_deb_extracted(&self, path: &Path, base: &Path, cap: u64) -> Result<ScanResult, ()> {
+        let mount = LoopMount::create(base, cap).ok_or(())?; // umount + rm on drop
+        let dir = mount.path();
 
         let extracted = Command::new("dpkg-deb")
             .arg("--raw-extract")
             .arg(path)
-            .arg(&dir)
+            .arg(dir)
             .stderr(Stdio::null())
             .status();
         match extracted {
             Ok(s) if s.success() => {}
-            _ => return Err(()), // extract failed (incl. disk pressure) → fall back
+            _ => return Err(()), // extract failed (incl. image ENOSPC) → fall back, mount torn down on drop
         }
 
-        // Pin clamscan's own descent temps to the same dir so they fall inside the
-        // headroom we already checked.
+        // Pin clamscan's own descent temps to the same capped image so they, too,
+        // fall inside the fence we already enforced.
         let tempdir_arg = format!("--tempdir={}", dir.display());
         let out = Command::new(&self.clamscan_path)
             .args(["--recursive", "--no-summary", "--infected"])
             .args(SCAN_LIMITS)
             .arg(&tempdir_arg)
-            .arg(&dir)
+            .arg(dir)
             .output();
 
         Ok(match out {
@@ -372,39 +399,6 @@ impl SystemClamBackend {
         }
     }
 
-    pub fn scan_directory(&self, path: &Path) -> Vec<(PathBuf, ScanResult)> {
-        let output = Command::new(&self.clamscan_path)
-            .args(["--recursive", "--no-summary"])
-            .arg(path)
-            .output();
-
-        match output {
-            Err(e) => vec![(path.to_path_buf(), ScanResult::Error(format!("clamscan failed: {}", e)))],
-            Ok(out) => {
-                let stdout  = String::from_utf8_lossy(&out.stdout);
-                let def_ver = self.get_definition_version().unwrap_or_default();
-                let mut results = vec![];
-                for line in stdout.lines() {
-                    let parts: Vec<&str> = line.splitn(2, ": ").collect();
-                    if parts.len() != 2 { continue; }
-                    let file_path = PathBuf::from(parts[0].trim());
-                    let status    = parts[1].trim();
-                    let result = if status == "OK" {
-                        ScanResult::Clean
-                    } else if status.ends_with("FOUND") {
-                        ThreatDetail::from_clamscan_line(line, &def_ver, "daily.cvd")
-                            .map(ScanResult::Threat)
-                            .unwrap_or(ScanResult::Clean)
-                    } else {
-                        ScanResult::Error(status.to_string())
-                    };
-                    results.push((file_path, result));
-                }
-                results
-            }
-        }
-    }
-
     pub fn get_definition_version(&self) -> Result<String> {
         let out = Command::new(&self.clamscan_path)
             .arg("--version")
@@ -463,34 +457,6 @@ pub fn check_definition_status(
     }
 }
 
-/// Returns true if the system clamav-freshclam service is currently active.
-/// Used to avoid conflicting with system-managed definition updates.
-pub fn system_freshclam_running() -> bool {
-    Command::new("systemctl")
-        .args(["is-active", "clamav-freshclam"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
-        .unwrap_or(false)
-}
-
-/// Runs freshclam directly — called only via pkexec from the UpdateDefinitions
-/// handler in main.rs. Requires polkit authorisation — never called silently.
-pub fn run_freshclam_update() -> Result<String> {
-    let out = Command::new("freshclam")
-        .output()
-        .context("freshclam not found — is ClamAV installed?")?;
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    if out.status.success() {
-        Ok(stdout)
-    } else {
-        Err(anyhow::anyhow!(
-            "freshclam failed: {}",
-            if !stderr.is_empty() { stderr } else { stdout }
-        ))
-    }
-}
-
 /// True if `path` looks like a Debian package by extension.
 fn is_deb(path: &Path) -> bool {
     path.extension().map(|e| e.eq_ignore_ascii_case("deb")).unwrap_or(false)
@@ -500,10 +466,27 @@ fn is_deb(path: &Path) -> bool {
 // Single-scan temp-extract support (footprint: transient only — write, scan, rm)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Free-space safety factor applied to the predicted extract size before the
-/// fast path is taken. Covers tar block padding plus clamscan's own descent
-/// temps, which share the same dir.
-const SPACE_MARGIN: u64 = 2;
+/// Hard ceiling on the per-scan capped scratch filesystem. The fast path extracts
+/// the package tree into a loopback-backed ext4 image of at most this size, so a
+/// decompression bomb — a `.deb` that declares a small `Installed-Size` but expands
+/// to tens of GB — faults against OUR boundary, not the host root filesystem. The
+/// bomb fills at most this many bytes of transient, reclaimed scratch instead of
+/// driving the real disk to zero free and ENOSPC-ing every other process.
+const LOOP_CAP_CEILING: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// Below this, a capped image is not worth provisioning — fall straight to the
+/// streaming (no-disk) scan instead.
+const LOOP_FLOOR: u64 = 256 * 1024 * 1024; // 256 MiB
+
+/// Size the capped scratch image: at most the ceiling, and never more than HALF
+/// the real free space on the backing store. The image is sparse and grows on the
+/// host disk as it fills, so keeping it under half of free guarantees the image
+/// ENOSPC-es before the host does — the bomb hits our fence first on any disk.
+/// `None` when free space is unknown or below the floor; the caller then streams.
+fn loop_cap(free: Option<u64>) -> Option<u64> {
+    let cap = (free? / 2).min(LOOP_CAP_CEILING);
+    if cap < LOOP_FLOOR { None } else { Some(cap) }
+}
 
 /// Resource fences applied to every `.deb` install scan. `--max-filesize` is the
 /// per-FILE ceiling (one honest large binary); `--max-scansize`/`--max-recursion`/
@@ -578,11 +561,149 @@ fn unscannable_msg(path: &Path, disk_pressure: bool, err: &str) -> String {
     }
 }
 
-/// Removes a temp dir (and its contents) when dropped, so a partial extract from
-/// a mid-write ENOSPC is cleaned immediately rather than left for the user.
-struct TempDirGuard(PathBuf);
-impl Drop for TempDirGuard {
+/// A per-scan, size-capped scratch filesystem: a sparse loopback-backed ext4
+/// image mounted `nosuid,nodev,noexec` under the scan base. It exists only for the
+/// duration of one `.deb` scan — created, used, then unmounted and deleted on drop
+/// (matching the engine's transient-footprint rule: nothing is reserved between
+/// installs). The cap is the decompression-bomb fence: extraction and clamscan's
+/// descent temps fault at `cap` against THIS image rather than the host root fs.
+struct LoopMount {
+    image:      PathBuf,
+    mountpoint: PathBuf,
+    mounted:    bool,
+}
+
+impl LoopMount {
+    /// Provision a `cap`-byte capped image and mount it. Returns `None` on any
+    /// provisioning failure (the caller then streams) — and never leaves a partial
+    /// mount or stray image behind, because a failed return drops `self`, whose
+    /// `Drop` unmounts (if mounted) and removes both the mountpoint and the image.
+    fn create(base: &Path, cap: u64) -> Option<Self> {
+        std::fs::create_dir_all(base).ok()?;
+        let _ = std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o700));
+
+        // Unique backing image under the (root-only 0700) base.
+        let image = {
+            let out = Command::new("mktemp")
+                .arg(format!("--tmpdir={}", base.display()))
+                .arg("--suffix=.img")
+                .arg("gsloop.XXXXXX")
+                .output().ok()?;
+            if !out.status.success() { return None; }
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if p.is_empty() { return None; }
+            PathBuf::from(p)
+        };
+        let mut m = LoopMount { image: image.clone(), mountpoint: PathBuf::new(), mounted: false };
+
+        // Sparse-size the image to the cap (no real bytes until written), lay down a
+        // journalless ext4 (transient — no journal, no reserved blocks, lazy inode
+        // table for a fast mkfs), then mount it. Any step failing tears the whole
+        // thing down via the Drop that runs on the early return.
+        let cap_s = cap.to_string();
+        let img   = image.to_string_lossy().into_owned();
+        if !run_ok("truncate", &["-s", cap_s.as_str(), img.as_str()]) { return None; }
+        if !run_ok("mkfs.ext4", &["-q", "-F", "-m0", "-O", "^has_journal",
+                                  "-E", "lazy_itable_init=1", img.as_str()]) { return None; }
+
+        let mountpoint = make_scan_dir(base)?;
+        m.mountpoint = mountpoint.clone();
+        let mp = mountpoint.to_string_lossy().into_owned();
+        if !run_ok("mount", &["-o", "loop,nosuid,nodev,noexec", img.as_str(), mp.as_str()]) {
+            return None;
+        }
+        m.mounted = true;
+
+        // Untrusted payload is extracted here — keep it root-only while it exists.
+        let _ = std::fs::set_permissions(&mountpoint, std::fs::Permissions::from_mode(0o700));
+        // One line so the fence is provable from `journalctl -u ghost-sentri-daemon`
+        // instead of by hand: mkfs/mount run silently, this records that the capped
+        // scratch actually engaged and at what ceiling.
+        log::info!(
+            "[fence] capped scan image mounted ({} MiB) at {}",
+            cap / (1024 * 1024),
+            mountpoint.display()
+        );
+        Some(m)
+    }
+
+    fn path(&self) -> &Path {
+        &self.mountpoint
+    }
+}
+
+impl Drop for LoopMount {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        // Unmount (the loop device auto-clears on umount), then remove the
+        // mountpoint and backing image. The clean path always reaches here; a crash
+        // between mount and drop leaks a mount + image, which `sweep_stale_scratch`
+        // (called at daemon start) closes.
+        if self.mounted {
+            let mp = self.mountpoint.to_string_lossy().into_owned();
+            let _ = run_ok("umount", &[mp.as_str()]);
+        }
+        if !self.mountpoint.as_os_str().is_empty() {
+            let _ = std::fs::remove_dir_all(&self.mountpoint);
+        }
+        let _ = std::fs::remove_file(&self.image);
+        log::info!("[fence] capped scan image released");
+    }
+}
+
+/// Run a command silently, returning true only on a clean exit. Every caller here
+/// degrades safely on failure (provisioning failure → streaming scan), so stderr
+/// is discarded rather than surfaced.
+fn run_ok(cmd: &str, args: &[&str]) -> bool {
+    Command::new(cmd)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Close fence scratch leaked by a crash between mount and `LoopMount::drop`
+/// (power loss, SIGKILL, OOM). The clean path always tears its own mount down, so
+/// this only ever finds debris after an unclean exit. Called ONCE at daemon start,
+/// before any scan runs.
+///
+/// Two kinds of debris under the scan base: still-mounted `gsscan.*` mountpoints
+/// (unmount, then remove) and orphaned `gsloop.*.img` backing images (remove).
+/// Unmount-before-remove matters — removing a live mountpoint would only empty the
+/// image, not release the loop device. Best-effort throughout: a busy mount that
+/// won't release is logged and left rather than forced.
+pub fn sweep_stale_scratch() {
+    let base = scan_tempdir_base();
+    let entries = match std::fs::read_dir(&base) {
+        Ok(e) => e,
+        Err(_) => return, // base absent → nothing ran yet, nothing to sweep
+    };
+
+    let mut swept = 0u32;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+
+        if name.starts_with("gsscan.") {
+            // A leaked mountpoint: unmount if still mounted (ignore "not mounted"),
+            // then remove the directory.
+            let mp = path.to_string_lossy().into_owned();
+            let _ = run_ok("umount", &[mp.as_str()]);
+            if std::fs::remove_dir_all(&path).is_ok() {
+                swept += 1;
+            }
+        } else if name.starts_with("gsloop.") && name.ends_with(".img") {
+            // A leaked backing image (its mount, if any, is cleared with the
+            // gsscan.* dir above; a bare image just needs deleting).
+            if std::fs::remove_file(&path).is_ok() {
+                swept += 1;
+            }
+        }
+    }
+
+    if swept > 0 {
+        log::info!("[fence] swept {swept} stale scan-scratch item(s) at start");
     }
 }

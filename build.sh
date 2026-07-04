@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# build.sh — v4.2
-# Ghost Sentri workspace build + .deb assembly (Linux Mint target).
+# build.sh — v4.3
+# Ghost Sentri workspace build + .deb assembly (Linux Mint / Ubuntu target).
 #
 # Builds the 3-crate workspace and stages three binaries:
 #   ghost-sentri            -> /usr/bin/ghost-sentri          (user GUI: dashboard + installer)
@@ -178,19 +178,20 @@ Package: ghost-sentri
 Version: ${PKG_VERSION}
 Architecture: ${ARCH}
 Maintainer: archerprojects <archer.projects@proton.me>
-Depends: clamav (>= 0.103), clamav-base, clamav-freshclam, libgtk-4-1, libadwaita-1-0, libdbus-1-3, dbus, policykit-1 | polkitd
-Recommends: clamav-daemon
+Depends: clamav (>= 0.103), clamav-base, clamav-freshclam, libgtk-4-1, libadwaita-1-0, libdbus-1-3, dbus, polkitd, pkexec
 Section: utils
 Priority: optional
-Homepage: https://github.com/archerprojects/Ghost-Sentri
+Homepage: https://github.com/archerprojects/ghost-sentri
 Description: Security monitor and install interceptor using ClamAV
  Ghost Sentri intercepts package installs and scans them with ClamAV before
  they execute. A resident headless daemon watches install channels; an
  on-demand GUI provides the dashboard and the install/scan flow; a privileged
  helper performs the scan and install under a single authorization prompt.
  .
- ClamAV must be installed. Definition freshness is checked daily by the daemon;
- updates require explicit user authorisation via polkit.
+ ClamAV must be installed. Ghost Sentri owns virus-definition updates: the
+ clamav-freshclam background service is disabled at install, definition
+ freshness is checked daily by the daemon, and updates run on demand from the
+ Ghost Sentri Settings tab under an explicit polkit authorisation.
 EOF
 
     # ── DEBIAN/postinst + postrm ────────────────────────────────────────────

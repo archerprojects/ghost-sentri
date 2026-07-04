@@ -17,19 +17,15 @@ use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
-    #[serde(default = "default_true")]
-    pub first_run:   bool,
     pub sentry:      SentryConfig,
     pub scan:        ScanConfig,
     pub quarantine:  QuarantineConfig,
     pub definitions: DefinitionConfig,
     pub backends:    BackendConfig,
-    pub log:         LogConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SentryConfig {
-    pub watched_extensions: Vec<String>,
     pub trusted_gpg_keys:   Vec<String>,
     /// Root-reachable install-decision socket (apt hook connects here as root).
     pub hook_socket_path:   PathBuf,
@@ -47,15 +43,9 @@ fn default_control_socket_path() -> PathBuf {
     PathBuf::from("/run/ghost-sentri/control.sock")
 }
 
-fn default_true() -> bool { true }
-
 impl Default for SentryConfig {
     fn default() -> Self {
         Self {
-            watched_extensions: vec![
-                "deb".into(), "appimage".into(), "rpm".into(),
-                "sh".into(), "flatpak".into(), "exe".into(), "msi".into(),
-            ],
             trusted_gpg_keys: vec![],
             hook_socket_path: PathBuf::from("/run/ghost-sentri/hook.sock"),
             control_socket_path: default_control_socket_path(),
@@ -66,6 +56,12 @@ impl Default for SentryConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ScanConfig {
     pub clamscan_path:       Option<PathBuf>,
+    /// Retained as the override point for the clamscan SCAN_LIMITS in the planned
+    /// detect-and-degrade path (probe clamscan version/flag support, fall back to a
+    /// permissive arg set). Not yet wired — annotated, not dropped, so the field
+    /// survives the round-trip through /etc without a blanket allow.
+    #[serde(default)]
+    #[allow(dead_code)]
     pub extra_clamscan_args: Vec<String>,
 }
 
@@ -91,19 +87,15 @@ impl Default for QuarantineConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DefinitionConfig {
-    pub update_interval_hours: u64,
     pub stale_threshold_days:  u64,
-    pub download_url:          String,
     pub definition_path:       Option<PathBuf>,
 }
 
 impl Default for DefinitionConfig {
     fn default() -> Self {
         Self {
-            update_interval_hours: 24,
-            stale_threshold_days:  2,
-            download_url:          "https://database.clamav.net".into(),
-            definition_path:       None,
+            stale_threshold_days: 2,
+            definition_path:      None,
         }
     }
 }
@@ -139,29 +131,14 @@ impl Default for BackendConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "lowercase")]
-pub enum LogVerbosity { Quiet, Normal, Verbose }
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct LogConfig {
-    pub verbosity: LogVerbosity,
-}
-
-impl Default for LogConfig {
-    fn default() -> Self { Self { verbosity: LogVerbosity::Normal } }
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
-            first_run:   true,
             sentry:      SentryConfig::default(),
             scan:        ScanConfig::default(),
             quarantine:  QuarantineConfig::default(),
             definitions: DefinitionConfig::default(),
             backends:    BackendConfig::default(),
-            log:         LogConfig::default(),
         }
     }
 }

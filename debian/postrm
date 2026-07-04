@@ -30,6 +30,16 @@ stop_service() {
     fi
 }
 
+# Undo the freshclam mask postinst applied, so removing Ghost Sentri hands the
+# distro's own definition updater back exactly as it was found. unmask, then
+# enable + start (the distro default state for the service).
+restore_freshclam() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl unmask clamav-freshclam.service 2>/dev/null || true
+        systemctl enable --now clamav-freshclam.service 2>/dev/null || true
+    fi
+}
+
 restore_mime() {
     if [ -e "$STATE/mimeapps.gs-backup" ]; then
         cp -a "$STATE/mimeapps.gs-backup" "$SYS_MIME" 2>/dev/null || true
@@ -45,12 +55,14 @@ restore_mime() {
 case "$1" in
     remove)
         stop_service
+        restore_freshclam
         rm -f "$HOOK"
         remove_dpkg_shim
         restore_mime
         ;;
     purge)
         stop_service
+        restore_freshclam
         rm -f "$HOOK"
         remove_dpkg_shim
         restore_mime

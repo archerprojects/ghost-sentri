@@ -1,24 +1,30 @@
-// daemon/src/daemon.rs — v4.0
+// daemon/src/daemon.rs — v5.0
 // Resident, headless daemon. Single source of truth for the dashboard.
 //
-// Split changes vs the pre-split in-GTK-process daemon:
-//   - No GTK, no relm4. Runs as the logged-in user inside the graphical session
-//     (REQUIRED — pkexec needs a session to show the polkit prompt; never run
-//     this as a system service).
+// Architecture (root system service):
+//   - No GTK, no relm4. Runs as a ROOT systemd SYSTEM service
+//     (ghost-sentri-daemon.service) — NOT in a user session. Privileged
+//     control-socket requests are authorised per-call via polkit's
+//     CheckAuthorization (polkit.rs); polkit routes the prompt into the caller's
+//     own graphical session via logind, so the daemon needs no session and there
+//     is no pkexec on this path.
 //   - Owns the state: monitor task handles, mode, definition status, and a
 //     bounded in-memory log ring for the dashboard.
-//   - Serves the control socket (user-only) — the on-demand dashboard connects,
-//     gets a snapshot, and streams live events.
+//   - Serves the control socket under /run/ghost-sentri (0666, per-request polkit
+//     gates the writes) — the on-demand dashboard connects, gets a snapshot, and
+//     streams live events.
 //   - Monitor toggles are REAL: the daemon owns the JoinHandles, so a toggle
-//     starts/aborts the actual backend task (and persists config).
-//   - Definition staleness check folded back in as a lightweight daily interval
-//     (the headless daemon is tiny, so the old systemd timer is unnecessary).
+//     starts/aborts the actual backend task; config is written by the in-process
+//     root apply (apply.rs) after a polkit authorisation.
+//   - Definition staleness check runs as a lightweight in-process daily interval
+//     (no systemd timer). Definition UPDATES run freshclam directly (daemon is
+//     root) after a polkit authorisation — never silent.
 //   - Installs are NOT performed here — the privileged worker does that. For the
-//     apt-hook path the daemon spawns the installer GUI and maps its exit code
-//     to the held apt transaction's proceed/cancel.
-//   - The daemon does NOT write the /var/log audit file (it is unprivileged);
-//     the root worker writes install events there. The daemon keeps the live
-//     ring for the dashboard.
+//     apt-hook path the hook process presents the daemon's headless verdict and
+//     maps the outcome to the held apt transaction's proceed/cancel.
+//   - The daemon does NOT write the /var/log audit file; the root worker writes
+//     install events there during an install. The daemon keeps the live ring for
+//     the dashboard.
 
 use anyhow::Result;
 use std::collections::{HashMap, VecDeque};
@@ -34,7 +40,7 @@ use ghost_sentri_core::protocol::{
     ControlEvent, ControlRequest, DefinitionSnapshot, MonitorState,
 };
 
-use crate::backends::{self, BackendKind, DedupeGuard, InterceptEvent, PackageVerdict, ScanVerdict};
+use crate::backends::{self, BackendKind, InterceptEvent, PackageVerdict, ScanVerdict};
 use crate::tray::{self, TrayCommand};
 
 const LOG_RING_CAP: usize = 500;
@@ -132,6 +138,10 @@ impl GhostDaemon {
 
         self.ensure_quarantine().await;
 
+        // Close any fence scratch a prior crash leaked (mounts/images under the scan
+        // base) before the first scan can provision a new one.
+        clam::sweep_stale_scratch();
+
         if !self.clam.is_available() {
             self.log("ClamAV (clamscan) not found — install with: sudo apt install clamav");
         }
@@ -180,26 +190,17 @@ impl GhostDaemon {
 
         self.log("Ghost Sentri daemon ready.");
 
-        // Main intercept loop.
-        let dedupe = DedupeGuard::new();
+        // Main intercept loop. It is serial (one event per recv), and hook+shim
+        // duplicates of the same install are collapsed downstream by the content-hash
+        // verdict cache in build_verdict → cached_scan, so no path-level dedupe is
+        // needed here.
         while let Some(mut event) = self.intercept_rx.recv().await {
-            let path = event.path.clone();
-            let blocking = event.hook_respond.is_some();
-
-            if blocking {
-                dedupe.release(&path);
-                dedupe.check(&path);
-            } else if !dedupe.check(&path) {
-                continue;
-            }
-
             let hook_respond = event.hook_respond.take();
 
             // Session suspend — proceed without scanning, but log it (no silent gap).
             if !self.state.lock().unwrap().active {
                 if let Some(tx) = hook_respond { let _ = tx.send(ScanVerdict::suspended()); }
                 self.log(format!("[SUSPENDED] Proceeded without scan: {}", event.filename()));
-                dedupe.release(&path);
                 continue;
             }
 
@@ -233,7 +234,6 @@ impl GhostDaemon {
                     self.log(format!("[Detected] {} — {}", event.backend, event.filename()));
                 }
             }
-            dedupe.release(&path);
         }
         Ok(())
     }
@@ -654,19 +654,17 @@ async fn handle_request(
         // Single-monitor reconcile (kept for compatibility). No write, so no auth.
         ControlRequest::ToggleMonitor { .. } => handle_reload(state, events_tx, intercept_tx).await,
 
+        // Disabled in this build. WrapperBackend resolves the target rc files from
+        // dirs::home_dir(), which under the ROOT system daemon is /root — so this
+        // would write shell wrappers into root's .bashrc, not the requesting user's.
+        // Terminal-build wrapper install belongs on the GUI side (per-user, resolved
+        // from the invoking uid) and lands with the traced-source-install feature.
+        // Refuse cleanly rather than corrupt root's shell config.
         ControlRequest::InstallWrappers => {
-            if !authorize(peer_pid, peer_uid).await {
-                let _ = events_tx.send(ControlEvent::WrappersInstalled {
-                    ok: false, message: "Authorisation declined — wrappers not installed.".into(),
-                });
-                return;
-            }
-            let socket = state.lock().unwrap().config.sentry.hook_socket_path.clone();
-            let (ok, message) = match crate::backends::wrapper::WrapperBackend::install_wrappers(&socket) {
-                Ok(files) => (true, format!("Installed wrappers ({} shell files updated)", files.len())),
-                Err(e)    => (false, format!("Wrapper install failed: {e}")),
-            };
-            let _ = events_tx.send(ControlEvent::WrappersInstalled { ok, message });
+            let _ = events_tx.send(ControlEvent::WrappersInstalled {
+                ok: false,
+                message: "Terminal-build wrappers are not available in this build.".into(),
+            });
         }
 
         // User-initiated definition update. The daemon is root, so it runs
@@ -760,7 +758,20 @@ async fn handle_request(
         ControlRequest::Reload => handle_reload(state, events_tx, intercept_tx).await,
 
         // Session scan suspend/resume — RAM-only, no config write, no polkit.
+        // Session scan suspend/resume — RAM-only, no config write. Still polkit-gated:
+        // the control socket is world-connectable (0666 + per-request polkit), so an
+        // ungated suspend would let any local process silently disable install
+        // scanning machine-wide before the next `apt install`. One auth per toggle.
         ControlRequest::SetActive { active } => {
+            if !authorize(peer_pid, peer_uid).await {
+                let _ = events_tx.send(ControlEvent::LogLine {
+                    line: "Authorisation declined — scanning state unchanged.".into(),
+                });
+                // Echo the unchanged state so the GUI reverts its optimistic toggle.
+                let current = state.lock().unwrap().active;
+                let _ = events_tx.send(ControlEvent::ActiveChanged { active: current });
+                return;
+            }
             state.lock().unwrap().active = active;
             let _ = events_tx.send(ControlEvent::ActiveChanged { active });
             let _ = events_tx.send(ControlEvent::LogLine {

@@ -38,6 +38,28 @@ case "$1" in
             systemctl restart ghost-sentri-daemon.service 2>/dev/null || true
         fi
 
+        # Ghost Sentri owns virus-definition updates (daily freshness check in the
+        # daemon; on-demand freshclam from the Settings tab under polkit). The distro
+        # clamav-freshclam service is a resident background downloader doing silent
+        # pulls — it violates the no-silent-download principle AND races GS's own
+        # freshclam for the definition-DB lock. Disable and MASK it so it cannot be
+        # re-activated by a dependency or a later clamav upgrade. postrm unmasks and
+        # re-enables it, so removing Ghost Sentri leaves the system stock.
+        # clamav-freshclam is a hard dependency, so it is always configured before us;
+        # this mask therefore always lands after its own enable.
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl disable --now clamav-freshclam.service 2>/dev/null || true
+            systemctl mask clamav-freshclam.service 2>/dev/null || true
+        fi
+
+        echo ""
+        echo "  NOTE: Ghost Sentri manages ClamAV virus-definition updates."
+        echo "  The clamav-freshclam background service has been stopped and masked to"
+        echo "  prevent silent downloads and definition-database lock contention."
+        echo "  Update definitions on demand from the Ghost Sentri Settings tab."
+        echo "  (Removing Ghost Sentri restores clamav-freshclam automatically.)"
+        echo ""
+
         echo "  Ghost Sentri installed and running (inert)."
         echo "  Open the dashboard, enable the scanners you want on the Settings tab"
         echo "  and Confirm — changes apply system-wide and take effect immediately."

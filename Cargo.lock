@@ -554,6 +554,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "dirs",
+ "log",
  "regex",
  "serde",
  "serde_json",
@@ -580,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-sentri-gui"
-version = "1.0.9"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "chrono",
