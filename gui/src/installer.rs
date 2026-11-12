@@ -1,4 +1,4 @@
-// gui/src/installer.rs — v7.0
+// gui/src/installer.rs — v1.1.0 — Thursday 12 November 2026
 // Installer UI — UNPRIVILEGED. Drives the privileged worker.
 //
 // Split flow (architecture B):

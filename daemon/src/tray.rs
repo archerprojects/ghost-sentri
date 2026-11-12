@@ -1,4 +1,4 @@
-// daemon/src/tray.rs — v1.0
+// daemon/src/tray.rs — v1.1.0 — Thursday 12 November 2026
 // System tray for the headless daemon. Pure ksni (DBus) — no GTK, no relm4.
 //
 // "Open Dashboard" launches the on-demand GUI process (`ghost-sentri`, default

@@ -1,4 +1,4 @@
-// daemon/src/bin/ghost-sentri-installer.rs — v1.0
+// daemon/src/bin/ghost-sentri-installer.rs — v1.1.0 — Thursday 12 November 2026
 // Privileged install worker. Headless, no GTK, no tokio — a short-lived state
 // machine that holds root (it is pkexec'd ONCE by the unprivileged installer GUI
 // at the up-front authorization) and drives scan + install + audit logging.
@@ -18,6 +18,10 @@
 // (root-owned — this is the one process that holds root during an install, which
 // is exactly why the audit write lives here and not in the unprivileged daemon).
 //
+// Allow list: a package whose exact SHA256 is on /etc/ghost-sentri/allowlist.toml
+// skips the ClamAV scan (an admin-approved false-positive override). The scan
+// itself holds the cross-process scan lock so it never overlaps a daemon scan.
+//
 // Fail-closed: a scan ERROR (package could not be scanned — extraction failure,
 // bomb fault, clamscan unavailable) BLOCKS the install, matching the apt-hook
 // path's `unscannable` hard-block. Only an explicit Install-Without-Scan choice
@@ -26,7 +30,8 @@
 use std::io::{BufRead, Write};
 use std::process::{Command, Stdio};
 
-use ghost_sentri_core::clam::{ScanResult, SystemClamBackend};
+use ghost_sentri_core::allowlist::{self, AllowList};
+use ghost_sentri_core::clam::{self, ScanResult, SystemClamBackend};
 use ghost_sentri_core::config::Config;
 use ghost_sentri_core::events::{self, Action, AuditEvent, ScanOutcome};
 use ghost_sentri_core::protocol::{
@@ -92,7 +97,22 @@ fn run(mode: WorkerMode, path: &str) -> i32 {
             let clam = SystemClamBackend::new(config.resolve_clamscan(), config.resolve_definition_path());
             emit(&WorkerOutbound::ScanProgress { message: format!("Scanning {}…", short(path)) });
 
-            match clam.scan_file(std::path::Path::new(path)) {
+            if let Some(sha) = allowlist::file_sha256(std::path::Path::new(path)) {
+                if AllowList::load().contains(&sha) {
+                    emit(&WorkerOutbound::ScanProgress {
+                        message: format!("{} is on the allow list — ClamAV skipped.", short(path)),
+                    });
+                    emit(&WorkerOutbound::ScanClean);
+                    return finish_with(mode, avenue, &user, path, package.as_deref(), ScanOutcome::NotScanned,
+                                       Some("on the allow list (sha256 match)"));
+                }
+            }
+
+            let result = {
+                let _lock = clam::acquire_scan_lock();
+                clam.scan_file(std::path::Path::new(path))
+            };
+            match result {
                 ScanResult::Clean => {
                     emit(&WorkerOutbound::ScanClean);
                     finish(mode, avenue, &user, path, package.as_deref(), ScanOutcome::Clean)
@@ -151,17 +171,31 @@ fn finish(
     package: Option<&str>,
     scan:    ScanOutcome,
 ) -> i32 {
+    finish_with(mode, avenue, user, path, package, scan, None)
+}
+
+/// `finish` with an extra audit detail (e.g. allow-list skip).
+fn finish_with(
+    mode:    WorkerMode,
+    avenue:  Avenue,
+    user:    &str,
+    path:    &str,
+    package: Option<&str>,
+    scan:    ScanOutcome,
+    note:    Option<&str>,
+) -> i32 {
     match mode {
         WorkerMode::EvaluateOnly => {
             // apt performs the install; we only approve the held transaction.
-            audit(user, avenue, Action::Installed, path, package, Some(scan), Some("approved (apt-hook)"));
+            let detail = match note { Some(n) => format!("approved (apt-hook); {n}"), None => "approved (apt-hook)".into() };
+            audit(user, avenue, Action::Installed, path, package, Some(scan), Some(&detail));
             emit(&WorkerOutbound::Done { approved: true, installed: false, message: "Approved".into() });
             0
         }
         WorkerMode::EvaluateAndInstall => {
             let ok = apt_install(path);
             let action = if ok { Action::Installed } else { Action::InstallFailed };
-            audit(user, avenue, action, path, package, Some(scan), None);
+            audit(user, avenue, action, path, package, Some(scan), note);
             emit(&WorkerOutbound::Done {
                 approved: true,
                 installed: ok,

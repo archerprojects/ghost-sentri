@@ -1,4 +1,4 @@
-# Cargo.toml — workspace root — v1.0
+# Cargo.toml — workspace root — v1.1.0 — Thursday 12 November 2026
 # Ghost Sentri v2.0 — split workspace.
 #
 # Members are added one stage at a time so each stage builds green in isolation:

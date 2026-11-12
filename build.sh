@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build.sh — v4.3
+# build.sh — v1.1.0 — Thursday 12 November 2026
 # Ghost Sentri workspace build + .deb assembly (Linux Mint / Ubuntu target).
 #
 # Builds the 3-crate workspace and stages three binaries:
@@ -30,7 +30,11 @@ BUILD_COUNTER_FILE="$(pwd)/.build_counter"
 if [ -f "$BUILD_COUNTER_FILE" ]; then
     BUILD_NUM=$(($(cat "$BUILD_COUNTER_FILE") + 1))
 else
-    BUILD_NUM=1
+    # Fresh checkout: the counter is never published (gitignored), so carry on
+    # from the patch already in gui/Cargo.toml. A clone of 1.1.0 builds as 1.1.0,
+    # not 1.0.0.
+    CARGO_PATCH="$(grep -m1 '^version' gui/Cargo.toml | cut -d'"' -f2 | cut -d. -f3)"
+    BUILD_NUM=$(( ${CARGO_PATCH:-0} + 1 ))
 fi
 echo "$BUILD_NUM" > "$BUILD_COUNTER_FILE"
 
@@ -38,8 +42,9 @@ echo "$BUILD_NUM" > "$BUILD_COUNTER_FILE"
 # the build counter is the PATCH, so each build climbs 1.0.0, 1.0.1, 1.0.2, …
 # The computed version is stamped back into gui/Cargo.toml before compiling, so
 # the About/welcome version (env!("CARGO_PKG_VERSION")) always matches the .deb.
-# Reset the sequence by deleting .build_counter; bump MAJOR.MINOR by editing
-# gui/Cargo.toml (e.g. 1.0.x -> 1.1.0) and deleting .build_counter.
+# Without .build_counter (fresh checkout) the sequence resumes from the version in
+# gui/Cargo.toml. To reset or bump MAJOR.MINOR, set gui/Cargo.toml to X.Y.0
+# (e.g. 1.0.x -> 1.1.0) and delete .build_counter.
 BASE_VERSION="$(grep -m1 '^version' gui/Cargo.toml | cut -d'"' -f2 | cut -d. -f1,2)"
 PATCH=$((BUILD_NUM - 1))
 PKG_VERSION="${BASE_VERSION}.${PATCH}"
@@ -179,6 +184,7 @@ Version: ${PKG_VERSION}
 Architecture: ${ARCH}
 Maintainer: archerprojects <archer.projects@proton.me>
 Depends: clamav (>= 0.103), clamav-base, clamav-freshclam, libgtk-4-1, libadwaita-1-0, libdbus-1-3, dbus, polkitd, pkexec
+Recommends: libnotify-bin
 Section: utils
 Priority: optional
 Homepage: https://github.com/archerprojects/ghost-sentri

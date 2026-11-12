@@ -1,4 +1,4 @@
-// core/src/events.rs — v1.0
+// core/src/events.rs — v1.1.0 — Thursday 12 November 2026
 // Machine-wide install audit trail.
 //
 // Threat model (locked in design): the adversary is the PACKAGE, not the user.
@@ -8,8 +8,8 @@
 //
 // One shared file for the whole machine: /var/log/ghost-sentri/events.jsonl
 //   - root-owned, world-readable (644) — anyone reads, only root writes
-//   - written by the privileged installer worker (the one context that already
-//     holds root during an install), so no separate privileged writer is needed
+//   - written by the privileged installer worker during an install, and by the
+//     root daemon for the Downloads watch and allow-list changes
 //   - JSON Lines (one object per line), NOT a JSON array: appends never rewrite
 //     the file, so a crash mid-write can't corrupt prior records, and you can
 //     still tail/grep it like a plain log.
@@ -38,6 +38,9 @@ pub enum Action {
     InstallFailed,
     Cancelled,   // user cancelled at the intercept
     Quarantined, // threat moved to quarantine instead of installed
+    Scanned,     // Downloads watch: file scanned (verdict in `scan`), left in place
+    Allowed,     // file hash added to the allow list (false-positive override)
+    AllowRemoved,
 }
 
 /// The scan verdict, if a scan was run.

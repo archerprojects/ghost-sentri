@@ -1,14 +1,19 @@
-// gui/src/main.rs
+// gui/src/main.rs — v1.1.0 — Thursday 12 November 2026
 // On-demand GTK4/libadwaita dashboard. Tabs: Dashboard, Scan, Quarantine, Settings, Help.
 // Dashboard is a read-only situation report (install-handler / monitor status,
 // definition freshness, memory, event log). Settings holds the controls: the
 // staged monitor toggle grid (Confirm Selections runs the root --apply via pkexec),
 // the definition-update button, and info blocks.
 // --check-definitions arg: stat .cvd mtime, push DefinitionStatus to the daemon.
+// 1.1.0: Downloads watch replaces the Wine/Flatpak monitors; the Quarantine tab
+// lists, restores and deletes the user's own quarantine (no password — it is the
+// user's folder); Settings carries the Downloads folders, the quarantine
+// location and the allow list (admin-gated through the daemon).
 // GDebi-style progress windows with Details expander. Lean blue progress bar via
 // app-level CSS. adw::init() before RelmApp::new().
 
 
+mod allow;
 mod control;
 mod installer;
 
@@ -16,7 +21,8 @@ use chrono::Local;
 use ghost_sentri_core::clam::{DefinitionStatus, ScanResult, SystemClamBackend};
 use ghost_sentri_core::config::Config;
 use ghost_sentri_core::protocol::{ControlEvent, ControlRequest};
-use ghost_sentri_core::quarantine::QuarantineRecord;
+use ghost_sentri_core::allowlist::AllowList;
+use ghost_sentri_core::quarantine;
 use gtk::gio::prelude::ApplicationExt;
 use relm4::adw::prelude::*;
 use relm4::gtk::glib;
@@ -243,8 +249,7 @@ fn dismiss_def_update_dialog() {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MonitorKind {
     PackagedApps,   // APT hook + MIME handler (.deb, .AppImage)
-    FlatpakApps,    // Flatpak bundle intercept
-    WineWindows,    // Wine .exe/.msi intercept
+    Downloads,      // Downloads watch — scans new files, quarantines threats
     TerminalBuilds, // Shell wrapper (pip, npm, cargo, make, etc)
     Snap,           // Snap — not yet built
 }
@@ -253,8 +258,7 @@ impl MonitorKind {
     fn label(&self) -> &'static str {
         match self {
             MonitorKind::PackagedApps   => "Packaged Apps",
-            MonitorKind::FlatpakApps    => "Flatpak Apps",
-            MonitorKind::WineWindows    => "Wine / Windows",
+            MonitorKind::Downloads      => "Downloads",
             MonitorKind::TerminalBuilds => "Terminal Builds",
             MonitorKind::Snap           => "Snap",
         }
@@ -267,8 +271,7 @@ impl MonitorKind {
     fn backend_id(&self) -> &'static str {
         match self {
             MonitorKind::PackagedApps   => "apt",
-            MonitorKind::FlatpakApps    => "flatpak",
-            MonitorKind::WineWindows    => "wine",
+            MonitorKind::Downloads      => "downloads",
             MonitorKind::TerminalBuilds => "source",
             MonitorKind::Snap           => "snap",
         }
@@ -277,8 +280,7 @@ impl MonitorKind {
     fn from_backend_id(id: &str) -> Option<MonitorKind> {
         Some(match id {
             "apt"     => MonitorKind::PackagedApps,
-            "flatpak" => MonitorKind::FlatpakApps,
-            "wine"    => MonitorKind::WineWindows,
+            "downloads" => MonitorKind::Downloads,
             "source"  => MonitorKind::TerminalBuilds,
             "snap"    => MonitorKind::Snap,
             _ => return None,
@@ -288,8 +290,7 @@ impl MonitorKind {
     fn all() -> Vec<MonitorKind> {
         vec![
             MonitorKind::PackagedApps,
-            MonitorKind::FlatpakApps,
-            MonitorKind::WineWindows,
+            MonitorKind::Downloads,
             MonitorKind::TerminalBuilds,
             MonitorKind::Snap,
         ]
@@ -472,7 +473,10 @@ pub struct DashboardModel {
     log_entries:               Vec<LogEntry>,
     #[allow(dead_code)] // virus-definition freshness — surfaced in the dashboard later
     definition_status:         Option<DefinitionStatus>,
-    quarantine_items:          Vec<QuarantineRecord>,
+    /// sha256 → quarantine id, for "Restore and allow" awaiting the allow result.
+    pending_restore:           HashMap<String, String>,
+    /// Kept so daemon events can rebuild the quarantine and allow-list rows.
+    ui_sender:                 Option<ComponentSender<DashboardModel>>,
     config:                    Config,
     window:                    Option<adw::Window>,
     scan_cancel:               Option<Arc<AtomicBool>>,
@@ -506,9 +510,19 @@ pub enum DashboardMsg {
     ScanProgress { done: usize, total: usize, line: Option<String> },
     ScanComplete(PathBuf, Vec<(PathBuf, ScanResult)>),
     CancelScan,
-    // Quarantine
-    OpenQuarantineViewer,
-    PurgeAll,
+    // Quarantine (the user's own folder)
+    QRefresh,
+    QTabShown,
+    QRestore(String),
+    QRestoreAllow(String),
+    QDelete(String),
+    QDeleteUnrecorded(String),
+    QDeleteAll,
+    QOpenFolder,
+    // Allow list / Downloads settings (admin-gated in the daemon)
+    AllowRemove(String),
+    SaveDownloadSettings,
+    Log(String),
     // Install (daemon-routed — from installer.rs via socket)
     InstallProgress(String),
     InstallComplete { success: bool },
@@ -661,7 +675,8 @@ impl SimpleComponent for DashboardModel {
             sentry_active:             true,
             log_entries:               vec![LogEntry::new(format!("Ghost Sentri v{} — initialising…", APP_VERSION))],
             definition_status:         None,
-            quarantine_items:          vec![],
+            pending_restore:           HashMap::new(),
+            ui_sender:                 Some(sender.clone()),
             config: config.clone(),
             window:                    Some(stored_window),
             scan_cancel:               None,
@@ -698,11 +713,10 @@ impl SimpleComponent for DashboardModel {
             ("deb", ".deb install handler"),
             ("apt", "apt install handler"),
         ];
-        let monitor_rows: [(&str, &str); 4] = [
-            ("flatpak", "Flatpak monitor"),
-            ("snap",    "Snap monitor"),
-            ("wine",    "Wine / Windows monitor"),
-            ("source",  "Terminal Builds monitor"),
+        let monitor_rows: [(&str, &str); 3] = [
+            ("downloads", "Downloads watch"),
+            ("snap",      "Snap monitor"),
+            ("source",    "Terminal Builds monitor"),
         ];
 
         let build_col = |heading: &str, rows: &[(&str, &str)]| -> gtk::Box {
@@ -741,8 +755,7 @@ impl SimpleComponent for DashboardModel {
         // Seed from whatever state we already have; the daemon snapshot refreshes
         // it on connect.
         apply_monitor_to_report("apt",     *model.monitor_states.get(&MonitorKind::PackagedApps).unwrap_or(&false));
-        apply_monitor_to_report("flatpak", *model.monitor_states.get(&MonitorKind::FlatpakApps).unwrap_or(&false));
-        apply_monitor_to_report("wine",    *model.monitor_states.get(&MonitorKind::WineWindows).unwrap_or(&false));
+        apply_monitor_to_report("downloads", *model.monitor_states.get(&MonitorKind::Downloads).unwrap_or(&false));
         apply_monitor_to_report("source",  *model.monitor_states.get(&MonitorKind::TerminalBuilds).unwrap_or(&false));
         apply_monitor_to_report("snap",    *model.monitor_states.get(&MonitorKind::Snap).unwrap_or(&false));
 
@@ -757,6 +770,13 @@ impl SimpleComponent for DashboardModel {
         report_def.set_selectable(true);
         report_outer.append(&report_def);
         REPORT_DEF_LABEL.with(|c| { *c.borrow_mut() = Some(report_def); });
+
+        // Unseen quarantine items (Downloads watch) — cleared by opening the tab.
+        let report_q = gtk::Label::new(None);
+        report_q.set_halign(gtk::Align::Start);
+        report_q.set_xalign(0.0);
+        report_outer.append(&report_q);
+        REPORT_Q_LABEL.with(|c| { *c.borrow_mut() = Some(report_q); });
 
         let report_sep2 = gtk::Separator::new(gtk::Orientation::Horizontal);
         report_sep2.set_margin_top(6);
@@ -818,19 +838,61 @@ impl SimpleComponent for DashboardModel {
         widgets.notebook.append_page(&scan_box, Some(&gtk::Label::new(Some("Scan"))));
 
         // ── Tab: Quarantine ───────────────────────────────────────────────────
-        let q_box  = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        q_box.set_margin_all(16);
-        q_box.set_valign(gtk::Align::Start);
-        let q_desc = gtk::Label::new(Some("Quarantined files are isolated and cannot execute."));
+        // The user's own quarantine folder. Restore and Delete act on it directly
+        // (it is theirs — no password); "Restore and allow" goes through the
+        // daemon for the admin-gated allow-list entry first.
+        let q_outer = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        q_outer.set_margin_all(16);
+        let q_desc = gtk::Label::new(Some(
+            "Threats found by the Downloads watch are moved here, with execute \
+             permission removed. Restore puts a file back in its folder; Restore and \
+             allow also stops it being flagged anywhere on this computer \
+             (administrator approval).",
+        ));
         q_desc.set_halign(gtk::Align::Start);
-        q_desc.set_margin_bottom(4);
-        let q_btn  = gtk::Button::with_label("View Quarantine");
-        q_btn.set_halign(gtk::Align::Start);
-        let s2 = sender.clone();
-        q_btn.connect_clicked(move |_| s2.input(DashboardMsg::OpenQuarantineViewer));
-        q_box.append(&q_desc);
-        q_box.append(&q_btn);
-        widgets.notebook.append_page(&q_box, Some(&gtk::Label::new(Some("Quarantine"))));
+        q_desc.set_wrap(true);
+        q_desc.set_xalign(0.0);
+        q_desc.add_css_class("dim-label");
+
+        let q_head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let q_count = gtk::Label::new(None);
+        q_count.set_halign(gtk::Align::Start);
+        q_count.set_hexpand(true);
+        q_count.set_xalign(0.0);
+        q_count.set_wrap(true);
+        let q_refresh = gtk::Button::with_label("Refresh");
+        let q_open = gtk::Button::with_label("Open folder");
+        let q_del_all = gtk::Button::with_label("Delete all…");
+        q_del_all.add_css_class("destructive-action");
+        {
+            let s = sender.clone();
+            q_refresh.connect_clicked(move |_| s.input(DashboardMsg::QRefresh));
+            let s = sender.clone();
+            q_open.connect_clicked(move |_| s.input(DashboardMsg::QOpenFolder));
+            let s = sender.clone();
+            q_del_all.connect_clicked(move |_| s.input(DashboardMsg::QDeleteAll));
+        }
+        q_head.append(&q_count);
+        q_head.append(&q_refresh);
+        q_head.append(&q_open);
+        q_head.append(&q_del_all);
+
+        let q_scroll = gtk::ScrolledWindow::builder()
+            .vexpand(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .build();
+        let q_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        q_scroll.set_child(Some(&q_list));
+
+        q_outer.append(&q_desc);
+        q_outer.append(&q_head);
+        q_outer.append(&q_scroll);
+        let q_tab_label = gtk::Label::new(Some("Quarantine"));
+        widgets.notebook.append_page(&q_outer, Some(&q_tab_label));
+        Q_LIST.with(|c| { *c.borrow_mut() = Some(q_list); });
+        Q_COUNT.with(|c| { *c.borrow_mut() = Some(q_count); });
+        Q_TAB_LABEL.with(|c| { *c.borrow_mut() = Some(q_tab_label); });
 
         // ── Tab: Settings — the controls ──────────────────────────────────────
         let settings_scroll = gtk::ScrolledWindow::builder()
@@ -850,7 +912,8 @@ impl SimpleComponent for DashboardModel {
         let mon_sub = gtk::Label::new(Some(
             "Select which install paths Ghost Sentri manages, then press Confirm \
              Selections. Changes are system-wide and require administrator \
-             authorisation. Flatpak and Snap are monitor-and-log only — the \
+             authorisation. Downloads scans new files in each user's download \
+             folders and quarantines threats. Snap is monitor-and-log only — the \
              dedicated installer performs those installs.",
         ));
         mon_sub.set_halign(gtk::Align::Start);
@@ -982,29 +1045,76 @@ impl SimpleComponent for DashboardModel {
 
         settings_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
-        // ── Section: Whitelist ────────────────────────────────────────────────
-        let wl_heading = gtk::Label::new(None);
-        wl_heading.set_markup("<b>Whitelist</b>");
-        wl_heading.set_halign(gtk::Align::Start);
+        // ── Section: Downloads Watch ──────────────────────────────────────────
+        let dl_heading = gtk::Label::new(None);
+        dl_heading.set_markup("<b>Downloads Watch</b>");
+        dl_heading.set_halign(gtk::Align::Start);
+        let dl_info = gtk::Label::new(Some(
+            "Each user's download folder is always watched. Add more folders here, \
+             separated by commas, each relative to the home folder (for example \
+             Downloads, Desktop). The quarantine folder is also relative to each \
+             home; changing it moves existing items. Saving needs administrator \
+             approval and applies to every user.",
+        ));
+        dl_info.set_halign(gtk::Align::Start);
+        dl_info.set_wrap(true);
+        dl_info.set_xalign(0.0);
+        dl_info.add_css_class("dim-label");
+        let dl_grid = gtk::Grid::builder().row_spacing(6).column_spacing(12).build();
+        let dl_folders_lbl = gtk::Label::new(Some("Extra folders"));
+        dl_folders_lbl.set_halign(gtk::Align::Start);
+        let dl_folders = gtk::Entry::new();
+        dl_folders.set_hexpand(true);
+        dl_folders.set_text(&model.config.downloads.folders.join(", "));
+        let dl_q_lbl = gtk::Label::new(Some("Quarantine folder"));
+        dl_q_lbl.set_halign(gtk::Align::Start);
+        let dl_q = gtk::Entry::new();
+        dl_q.set_hexpand(true);
+        dl_q.set_text(&model.config.quarantine.dir);
+        dl_grid.attach(&dl_folders_lbl, 0, 0, 1, 1);
+        dl_grid.attach(&dl_folders, 1, 0, 1, 1);
+        dl_grid.attach(&dl_q_lbl, 0, 1, 1, 1);
+        dl_grid.attach(&dl_q, 1, 1, 1, 1);
+        let dl_save = gtk::Button::with_label("Save Downloads Settings");
+        dl_save.set_halign(gtk::Align::Start);
+        dl_save.add_css_class("suggested-action");
+        {
+            let s = sender.clone();
+            dl_save.connect_clicked(move |_| s.input(DashboardMsg::SaveDownloadSettings));
+        }
+        DL_FOLDERS_ENTRY.with(|c| { *c.borrow_mut() = Some(dl_folders); });
+        DL_QDIR_ENTRY.with(|c| { *c.borrow_mut() = Some(dl_q); });
+        let dl_section = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        dl_section.append(&dl_heading);
+        dl_section.append(&dl_info);
+        dl_section.append(&dl_grid);
+        dl_section.append(&dl_save);
+        settings_box.append(&dl_section);
 
-        let trusted_keys = &model.config.sentry.trusted_gpg_keys;
-        let wl_text = if trusted_keys.is_empty() {
-            "No trusted GPG keys configured.\nWhitelist path and package entries coming in a future release.".to_string()
-        } else {
-            format!(
-                "Trusted GPG keys: {}\n\nWhitelist path and package entries coming in a future release.",
-                trusted_keys.join(", ")
-            )
-        };
-        let wl_info = gtk::Label::new(Some(&wl_text));
-        wl_info.set_halign(gtk::Align::Start);
-        wl_info.set_wrap(true);
-        wl_info.add_css_class("dim-label");
+        settings_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
-        let wl_section = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        wl_section.append(&wl_heading);
-        wl_section.append(&wl_info);
-        settings_box.append(&wl_section);
+        // ── Section: Allow List ───────────────────────────────────────────────
+        let al_heading = gtk::Label::new(None);
+        al_heading.set_markup("<b>Allow List</b>");
+        al_heading.set_halign(gtk::Align::Start);
+        let al_info = gtk::Label::new(Some(
+            "Files listed here skip the virus scan everywhere on this computer — \
+             downloads, apt and double-click installs. Each entry matches one exact \
+             file by its SHA256 hash, never by name or source, so any other version \
+             is still scanned. Package script checks still run. Entries do not \
+             expire; removing one needs administrator approval.",
+        ));
+        al_info.set_halign(gtk::Align::Start);
+        al_info.set_wrap(true);
+        al_info.set_xalign(0.0);
+        al_info.add_css_class("dim-label");
+        let al_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        ALLOW_BOX.with(|c| { *c.borrow_mut() = Some(al_box.clone()); });
+        let al_section = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        al_section.append(&al_heading);
+        al_section.append(&al_info);
+        al_section.append(&al_box);
+        settings_box.append(&al_section);
 
         // ── Section: Setup guide + config path ────────────────────────────────
         settings_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
@@ -1046,12 +1156,15 @@ impl SimpleComponent for DashboardModel {
              A) After scanner activation, (GS) becomes the default install handler for \
              distro package installations system-wide. Install files can be scanned for \
              malicious code before installation.\n\
-             B) Flatpak, Snap, Wine and Build installations are monitored and logged for \
-             reference.\n\
+             B) Downloads are watched: new programs, installers, scripts and archives \
+             saved to each user's download folders are scanned, and threats are moved to \
+             that user's quarantine. Snap and Build installations are monitored and \
+             logged for reference.\n\
              The scanners and monitors are enabled independently from the Settings tab in \
              the application Dashboard.\n\
              C) Targeted drive, folder or file scans.\n\
-             D) Quarantine separation for install packages that trigger virus response.\n\n\
+             D) Quarantine: threats found in downloads are kept in your own quarantine \
+             folder, where you can restore or delete them from the Quarantine tab.\n\n\
              The application dashboard front page displays the current status of package \
              handlers, virus definitions, daemon connection and other system status \
              information.\n\n\
@@ -1061,9 +1174,17 @@ impl SimpleComponent for DashboardModel {
              until it is approved or scanned.\n\n\
              Terminal Builds — Monitors and logs source / script installs (make install, \
              curl | bash, pip, npm).\n\n\
-             Wine — Monitors Wine prefixes for incoming Windows executables (.exe, .msi).\n\n\
-             Flatpak and Snap — monitors and logs only — the dedicated installer performs \
-             the install.\n\n\
+             Downloads — Scans new files in each user's download folders: Linux packages \
+             and installers, scripts, Windows programs (.exe, .msi), Java archives, \
+             archives and disc images, and any file that is a program whatever its name. \
+             Several files arriving together are scanned in one pass. Threats are \
+             quarantined and you are notified. Files over 512 MB, and files that could \
+             not be fully scanned, are left in place with a notice.\n\n\
+             Allow list — if a file you trust is flagged (a false positive), you can \
+             allow that exact file by its SHA256 hash, with administrator approval. It \
+             then skips the virus scan everywhere; any other version is still scanned.\n\n\
+             Snap — monitors and logs only — the dedicated installer performs the \
+             install.\n\n\
              When a distro package install is detected, a dialog allows you to select:\n\
              • Scan Now — ClamAV scans the file before install proceeds\n\
              • Proceed Without Scan — bypass for trusted sources\n\
@@ -1080,6 +1201,20 @@ impl SimpleComponent for DashboardModel {
         help_box.append(&help_text);
         help_scroll.set_child(Some(&help_box));
         widgets.notebook.append_page(&help_scroll, Some(&gtk::Label::new(Some("Help"))));
+
+        // ── Quarantine + allow list: first draw, tab-open marks items seen ────
+        render_quarantine(&model.q_dir(), &sender, model.window.as_ref());
+        render_allowlist(&sender, model.window.as_ref());
+        {
+            let s = sender.clone();
+            widgets.notebook.connect_switch_page(move |_, _, n| {
+                if n == QUARANTINE_PAGE { s.input(DashboardMsg::QTabShown); }
+            });
+        }
+        if START_ON_QUARANTINE.with(|c| c.get()) {
+            let nb = widgets.notebook.clone();
+            glib::idle_add_local_once(move || nb.set_current_page(Some(QUARANTINE_PAGE)));
+        }
 
         // ── Welcome dialog — shown each launch (per version) until dismissed ──
         if !welcome_dismissed() {
@@ -1209,10 +1344,122 @@ impl SimpleComponent for DashboardModel {
                 show_scan_summary_dialog(&summary, threats, self.window.as_ref());
             }
 
-            DashboardMsg::OpenQuarantineViewer => {
-                show_quarantine_dialog(&self.quarantine_items, self.window.as_ref());
+            DashboardMsg::QRefresh => self.render_quarantine(),
+
+            DashboardMsg::QTabShown => {
+                // Draw with the NEW highlights first, then mark them seen.
+                self.render_quarantine();
+                let _ = quarantine::mark_all_seen(&self.q_dir());
+                update_unseen_badges(0);
             }
-            DashboardMsg::PurgeAll => { self.log("Purge initiated...".to_string()); }
+
+            DashboardMsg::QRestore(id) => {
+                match quarantine::restore(&self.q_dir(), &id) {
+                    Ok(p) => self.log(format!("[Quarantine] Restored to {} (not executable).", p.display())),
+                    Err(e) => self.log_threat(format!("[Quarantine] Restore failed: {e}")),
+                }
+                self.render_quarantine();
+            }
+
+            DashboardMsg::QRestoreAllow(id) => {
+                let rec = quarantine::load_manifest(&self.q_dir()).into_iter().find(|r| r.id == id);
+                match (rec, &self.control_tx) {
+                    (Some(r), Some(tx)) if !r.sha256.is_empty() => {
+                        self.pending_restore.insert(r.sha256.clone(), id);
+                        let _ = tx.try_send(ControlRequest::AllowHash {
+                            sha256: r.sha256.clone(),
+                            threat: r.threat_name.clone(),
+                            filename: r.filename.clone(),
+                        });
+                        self.log(format!("[Quarantine] Allowing {} — administrator approval required…", r.filename));
+                    }
+                    (Some(r), _) if r.sha256.is_empty() => {
+                        self.log_threat(format!("[Quarantine] {} has no recorded hash and cannot be allowed.", r.filename));
+                    }
+                    (Some(_), None) => self.log("Not connected to the daemon — cannot allow.".to_string()),
+                    _ => self.render_quarantine(),
+                }
+            }
+
+            DashboardMsg::QDelete(id) => {
+                let dir = self.q_dir();
+                let name = quarantine::load_manifest(&dir).into_iter().find(|r| r.id == id)
+                    .map(|r| r.filename).unwrap_or_default();
+                let s = sender.clone();
+                confirm(self.window.as_ref(), "Delete this file?",
+                    &format!("{name} will be deleted permanently."), "Delete", move || {
+                        let msg = match quarantine::delete(&dir, &id) {
+                            Ok(()) => format!("[Quarantine] Deleted {name}."),
+                            Err(e) => format!("[Quarantine] Delete failed: {e}"),
+                        };
+                        s.input(DashboardMsg::Log(msg));
+                        s.input(DashboardMsg::QRefresh);
+                    });
+            }
+
+            DashboardMsg::QDeleteUnrecorded(name) => {
+                let dir = self.q_dir();
+                let s = sender.clone();
+                confirm(self.window.as_ref(), "Delete this file?",
+                    &format!("{name} will be deleted permanently."), "Delete", move || {
+                        let msg = match quarantine::delete_unrecorded(&dir, &name) {
+                            Ok(()) => format!("[Quarantine] Deleted {name}."),
+                            Err(e) => format!("[Quarantine] Delete failed: {e}"),
+                        };
+                        s.input(DashboardMsg::Log(msg));
+                        s.input(DashboardMsg::QRefresh);
+                    });
+            }
+
+            DashboardMsg::QDeleteAll => {
+                let dir = self.q_dir();
+                let n = quarantine::load_manifest(&dir).len() + quarantine::unrecorded(&dir).len();
+                if n == 0 { return; }
+                let s = sender.clone();
+                confirm(self.window.as_ref(), "Delete everything in quarantine?",
+                    &format!("{n} file(s) will be deleted permanently."), "Delete all", move || {
+                        let msg = match quarantine::delete_all(&dir) {
+                            Ok(()) => "[Quarantine] Quarantine emptied.".to_string(),
+                            Err(e) => format!("[Quarantine] Delete failed: {e}"),
+                        };
+                        s.input(DashboardMsg::Log(msg));
+                        s.input(DashboardMsg::QRefresh);
+                    });
+            }
+
+            DashboardMsg::QOpenFolder => {
+                let dir = self.q_dir();
+                let _ = quarantine::ensure_dir(&dir);
+                match std::process::Command::new("xdg-open").arg(&dir).spawn() {
+                    Ok(mut c) => { std::thread::spawn(move || { let _ = c.wait(); }); }
+                    Err(e) => self.log(format!("Could not open {}: {e}", dir.display())),
+                }
+            }
+
+            DashboardMsg::AllowRemove(sha) => {
+                if let Some(tx) = &self.control_tx {
+                    let _ = tx.try_send(ControlRequest::RemoveAllow { sha256: sha });
+                    self.log("Removing allow-list entry — administrator approval required…".to_string());
+                } else {
+                    self.log("Not connected to the daemon — cannot change the allow list.".to_string());
+                }
+            }
+
+            DashboardMsg::SaveDownloadSettings => {
+                let folders: Vec<String> = DL_FOLDERS_ENTRY.with(|c| c.borrow().as_ref().map(|e| e.text().to_string()))
+                    .unwrap_or_default()
+                    .split(',').map(|f| f.trim().to_string()).filter(|f| !f.is_empty()).collect();
+                let quarantine_dir = DL_QDIR_ENTRY.with(|c| c.borrow().as_ref().map(|e| e.text().to_string()))
+                    .unwrap_or_default().trim().to_string();
+                if let Some(tx) = &self.control_tx {
+                    let _ = tx.try_send(ControlRequest::SetDownloadSettings { folders, quarantine_dir });
+                    self.log("Saving Downloads settings — administrator approval required…".to_string());
+                } else {
+                    self.log("Not connected to the daemon — cannot save settings.".to_string());
+                }
+            }
+
+            DashboardMsg::Log(line) => self.log(line),
 
             DashboardMsg::UpdateDefinitions => {
                 // The GUI is unprivileged; the root daemon runs freshclam after a
@@ -1368,6 +1615,17 @@ impl DashboardModel {
         self.log_entries.push(entry);
     }
 
+    /// This user's quarantine folder.
+    fn q_dir(&self) -> PathBuf {
+        self.config.quarantine.dir_for(&user_home())
+    }
+
+    fn render_quarantine(&self) {
+        if let Some(s) = &self.ui_sender {
+            render_quarantine(&self.q_dir(), s, self.window.as_ref());
+        }
+    }
+
     fn refresh_confirm(&self) {
         set_confirm_sensitive(!self.pending_monitors.is_empty() || self.pending_defs);
     }
@@ -1455,6 +1713,42 @@ impl DashboardModel {
 
             ControlEvent::WrappersInstalled { ok, message } => {
                 if ok { self.log(message); } else { self.log_threat(message); }
+            }
+
+            ControlEvent::AllowResult { sha256, ok, message } => {
+                if let Some(id) = self.pending_restore.remove(&sha256) {
+                    if ok {
+                        match quarantine::restore(&self.q_dir(), &id) {
+                            Ok(p) => self.log(format!("[Quarantine] Allowed and restored to {}.", p.display())),
+                            Err(e) => self.log_threat(format!("[Quarantine] Allowed, but restore failed: {e}")),
+                        }
+                    } else {
+                        self.log(format!("[Quarantine] Not restored: {message}"));
+                    }
+                    self.render_quarantine();
+                } else if ok {
+                    self.log(format!("[Allow] {message}"));
+                } else {
+                    self.log_threat(format!("[Allow] {message}"));
+                }
+            }
+
+            ControlEvent::AllowListChanged => {
+                if let Some(s) = &self.ui_sender { render_allowlist(s, self.window.as_ref()); }
+            }
+
+            ControlEvent::QuarantineUpdated => self.render_quarantine(),
+
+            ControlEvent::SettingsResult { ok, message } => {
+                if ok {
+                    self.log(message);
+                    self.config = Config::load().unwrap_or_default();
+                    DL_FOLDERS_ENTRY.with(|c| { if let Some(e) = c.borrow().as_ref() { e.set_text(&self.config.downloads.folders.join(", ")); } });
+                    DL_QDIR_ENTRY.with(|c| { if let Some(e) = c.borrow().as_ref() { e.set_text(&self.config.quarantine.dir); } });
+                    self.render_quarantine();
+                } else {
+                    self.log_threat(message);
+                }
             }
         }
     }
@@ -1621,9 +1915,10 @@ fn show_first_run_dialog(sender: &ComponentSender<DashboardModel>, window: Optio
          (GS) requires current ClamAV virus definitions installed to function. (GS) can be \
          selected to manage installations and scan for possible threats or malicious code \
          in the install packages; targeted to scan drives, folders or files for malicious \
-         content and quarantine suspicious files when requested. For Flatpak and Snap \
-         installations, (GS) acts as a monitor and logger only while the dedicated system \
-         install application performs the install. On initial installation, all scanners \
+         content and quarantine suspicious files when requested; and to watch download \
+         folders, scanning new programs and quarantining threats. For Snap installations, \
+         (GS) acts as a monitor and logger only while the dedicated system install \
+         application performs the install. On initial installation, all scanners \
          are disabled and require enabling in the application dashboard settings tab to \
          allow the (GS) daemon monitor to detect and manage installs on the system. This is \
          a system-wide activation requiring root privileges.\n\n\
@@ -1698,20 +1993,230 @@ fn show_scan_summary_dialog(summary: &str, threats: usize, window: Option<&adw::
     dialog.present(window);
 }
 
-fn show_quarantine_dialog(items: &[QuarantineRecord], window: Option<&adw::Window>) {
-    let body = if items.is_empty() {
-        "Quarantine is empty.".to_string()
-    } else {
-        items.iter()
-            .map(|r| format!("{} — {} — {}", r.filename, r.threat_name,
-                r.timestamp.format("%Y-%m-%d %H:%M")))
-            .collect::<Vec<_>>().join("\n")
-    };
-    let dialog = adw::AlertDialog::new(Some("Quarantine Contents"), Some(&body));
-    dialog.add_response("close", "Close");
-    dialog.set_default_response(Some("close"));
-    dialog.set_close_response("close");
-    dialog.present(window);
+// ── Quarantine tab rows ───────────────────────────────────────────────────────
+
+thread_local! {
+    static Q_LIST:      std::cell::RefCell<Option<gtk::Box>>   = const { std::cell::RefCell::new(None) };
+    static Q_COUNT:     std::cell::RefCell<Option<gtk::Label>> = const { std::cell::RefCell::new(None) };
+    static Q_TAB_LABEL: std::cell::RefCell<Option<gtk::Label>> = const { std::cell::RefCell::new(None) };
+    static REPORT_Q_LABEL: std::cell::RefCell<Option<gtk::Label>> = const { std::cell::RefCell::new(None) };
+    static ALLOW_BOX:   std::cell::RefCell<Option<gtk::Box>>   = const { std::cell::RefCell::new(None) };
+    static DL_FOLDERS_ENTRY: std::cell::RefCell<Option<gtk::Entry>> = const { std::cell::RefCell::new(None) };
+    static DL_QDIR_ENTRY:    std::cell::RefCell<Option<gtk::Entry>> = const { std::cell::RefCell::new(None) };
+    /// Set by `--tab quarantine` (notice action) before the dashboard starts.
+    static START_ON_QUARANTINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Notebook index of the Quarantine tab (Dashboard, Scan, Quarantine, …).
+const QUARANTINE_PAGE: u32 = 2;
+
+fn user_home() -> PathBuf {
+    std::env::var_os("HOME").map(PathBuf::from).or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from("/"))
+}
+
+fn clear_box(b: &gtk::Box) {
+    while let Some(c) = b.first_child() {
+        b.remove(&c);
+    }
+}
+
+/// Tab label count and the Dashboard line.
+fn update_unseen_badges(unseen: usize) {
+    Q_TAB_LABEL.with(|c| {
+        if let Some(l) = c.borrow().as_ref() {
+            if unseen > 0 {
+                l.set_markup(&format!("Quarantine <span foreground='#cc3333' weight='bold'>({unseen})</span>"));
+            } else {
+                l.set_label("Quarantine");
+            }
+        }
+    });
+    REPORT_Q_LABEL.with(|c| {
+        if let Some(l) = c.borrow().as_ref() {
+            if unseen > 0 {
+                l.set_markup(&format!(
+                    "<span foreground='#cc3333'>Quarantine — {unseen} new item{} (see the Quarantine tab)</span>",
+                    if unseen == 1 { "" } else { "s" }
+                ));
+            } else {
+                l.set_markup("<span foreground='#888888'>Quarantine — nothing new</span>");
+            }
+        }
+    });
+}
+
+fn small_button(label: &str) -> gtk::Button {
+    let b = gtk::Button::with_label(label);
+    b.set_valign(gtk::Align::Center);
+    b
+}
+
+/// Rebuild the Quarantine tab from the user's manifest and folder.
+fn render_quarantine(dir: &Path, sender: &ComponentSender<DashboardModel>, _window: Option<&adw::Window>) {
+    let _ = quarantine::reconcile(dir);
+    let mut records = quarantine::load_manifest(dir);
+    records.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
+    let stray = quarantine::unrecorded(dir);
+    let total = records.len() + stray.len();
+    update_unseen_badges(records.iter().filter(|r| !r.seen).count());
+    Q_COUNT.with(|c| {
+        if let Some(l) = c.borrow().as_ref() {
+            l.set_label(&format!("{total} item{} in {}", if total == 1 { "" } else { "s" }, dir.display()));
+        }
+    });
+    Q_LIST.with(|c| {
+        let Some(list) = c.borrow().as_ref().cloned() else { return };
+        clear_box(&list);
+        if total == 0 {
+            let l = gtk::Label::new(Some("Quarantine is empty."));
+            l.set_halign(gtk::Align::Start);
+            l.add_css_class("dim-label");
+            list.append(&l);
+            return;
+        }
+        for r in records {
+            let frame = gtk::Frame::new(None);
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            row.set_margin_all(8);
+            let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            text.set_hexpand(true);
+            let title = gtk::Label::new(None);
+            title.set_markup(&format!(
+                "<b>{}</b>{}",
+                glib::markup_escape_text(&r.filename),
+                if r.seen { String::new() } else { "  <span foreground='#cc3333' weight='bold'>NEW</span>".to_string() },
+            ));
+            title.set_halign(gtk::Align::Start);
+            title.set_xalign(0.0);
+            title.set_wrap(true);
+            let from = r.original_path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+            let sub = gtk::Label::new(Some(&format!(
+                "{} · {} · from {}",
+                r.threat_name,
+                r.timestamp.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
+                from,
+            )));
+            sub.set_halign(gtk::Align::Start);
+            sub.set_xalign(0.0);
+            sub.set_wrap(true);
+            sub.add_css_class("dim-label");
+            text.append(&title);
+            text.append(&sub);
+            row.append(&text);
+
+            let restore = small_button("Restore");
+            let allow = small_button("Restore and allow…");
+            let delete = small_button("Delete…");
+            delete.add_css_class("destructive-action");
+            let (s1, s2, s3) = (sender.clone(), sender.clone(), sender.clone());
+            let (i1, i2, i3) = (r.id.clone(), r.id.clone(), r.id.clone());
+            restore.connect_clicked(move |_| s1.input(DashboardMsg::QRestore(i1.clone())));
+            allow.connect_clicked(move |_| s2.input(DashboardMsg::QRestoreAllow(i2.clone())));
+            delete.connect_clicked(move |_| s3.input(DashboardMsg::QDelete(i3.clone())));
+            row.append(&restore);
+            row.append(&allow);
+            row.append(&delete);
+            frame.set_child(Some(&row));
+            list.append(&frame);
+        }
+        for name in stray {
+            let frame = gtk::Frame::new(None);
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            row.set_margin_all(8);
+            let title = gtk::Label::new(None);
+            title.set_markup(&format!(
+                "<b>{}</b>  <span foreground='#888888'>unrecorded</span>",
+                glib::markup_escape_text(&name)
+            ));
+            title.set_halign(gtk::Align::Start);
+            title.set_hexpand(true);
+            title.set_xalign(0.0);
+            title.set_wrap(true);
+            let delete = small_button("Delete…");
+            delete.add_css_class("destructive-action");
+            let s = sender.clone();
+            delete.connect_clicked(move |_| s.input(DashboardMsg::QDeleteUnrecorded(name.clone())));
+            row.append(&title);
+            row.append(&delete);
+            frame.set_child(Some(&row));
+            list.append(&frame);
+        }
+    });
+}
+
+/// Rebuild the Settings allow-list rows from /etc/ghost-sentri/allowlist.toml.
+fn render_allowlist(sender: &ComponentSender<DashboardModel>, window: Option<&adw::Window>) {
+    let list = AllowList::load();
+    ALLOW_BOX.with(|c| {
+        let Some(b) = c.borrow().as_ref().cloned() else { return };
+        clear_box(&b);
+        if list.entries.is_empty() {
+            let l = gtk::Label::new(Some("No files are on the allow list."));
+            l.set_halign(gtk::Align::Start);
+            l.add_css_class("dim-label");
+            b.append(&l);
+            return;
+        }
+        for e in list.entries {
+            let frame = gtk::Frame::new(None);
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            row.set_margin_all(8);
+            let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            text.set_hexpand(true);
+            let title = gtk::Label::new(None);
+            let name = if e.filename.is_empty() { "(no file name recorded)".to_string() } else { e.filename.clone() };
+            title.set_markup(&format!(
+                "<b>{}</b> — allowed over {}",
+                glib::markup_escape_text(&name),
+                glib::markup_escape_text(&e.threat),
+            ));
+            title.set_halign(gtk::Align::Start);
+            title.set_xalign(0.0);
+            title.set_wrap(true);
+            let when = e.allowed_at.get(..10).unwrap_or(&e.allowed_at);
+            let sub = gtk::Label::new(Some(&format!("by {} on {} · sha256 {}", e.allowed_by, when, e.sha256)));
+            sub.set_halign(gtk::Align::Start);
+            sub.set_xalign(0.0);
+            sub.set_wrap(true);
+            sub.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+            sub.set_selectable(true);
+            sub.add_css_class("dim-label");
+            text.append(&title);
+            text.append(&sub);
+            let remove = small_button("Remove…");
+            let s = sender.clone();
+            let w = window.cloned();
+            let sha = e.sha256.clone();
+            let shown = name.clone();
+            remove.connect_clicked(move |_| {
+                let s = s.clone();
+                let sha = sha.clone();
+                confirm(w.as_ref(), "Remove from the allow list?",
+                    &format!("{shown} will be scanned again like any other file."), "Remove",
+                    move || s.input(DashboardMsg::AllowRemove(sha.clone())));
+            });
+            row.append(&text);
+            row.append(&remove);
+            frame.set_child(Some(&row));
+            b.append(&frame);
+        }
+    });
+}
+
+/// Two-button confirmation; `on_ok` runs only on the confirming button.
+fn confirm(window: Option<&adw::Window>, heading: &str, body: &str, ok_label: &str, on_ok: impl Fn() + 'static) {
+    let d = adw::AlertDialog::new(Some(heading), Some(body));
+    d.add_response("cancel", "Cancel");
+    d.add_response("ok", ok_label);
+    d.set_response_appearance("ok", adw::ResponseAppearance::Destructive);
+    d.set_default_response(Some("cancel"));
+    d.set_close_response("cancel");
+    d.connect_response(None, move |_, r| {
+        if r == "ok" {
+            on_ok();
+        }
+    });
+    d.present(window);
 }
 
 
@@ -1722,8 +2227,7 @@ fn show_quarantine_dialog(items: &[QuarantineRecord], window: Option<&adw::Windo
 fn monitor_states_from_config(config: &Config) -> HashMap<MonitorKind, bool> {
     let mut map = HashMap::new();
     map.insert(MonitorKind::PackagedApps,   config.backends.enable_apt);
-    map.insert(MonitorKind::FlatpakApps,    config.backends.enable_flatpak);
-    map.insert(MonitorKind::WineWindows,    config.backends.enable_wine);
+    map.insert(MonitorKind::Downloads,      config.backends.enable_downloads);
     map.insert(MonitorKind::TerminalBuilds, config.backends.enable_build_source);
     map.insert(MonitorKind::Snap,           config.backends.enable_snap);
     map
@@ -1733,6 +2237,9 @@ fn monitor_states_from_config(config: &Config) -> HashMap<MonitorKind, bool> {
 //
 // GUI personalities (the daemon owns --apt-hook / --wrapper-hook / def checks):
 //   --install <path> [--apt-hook]   run the installer UI (apt-hook ⇒ evaluate-only)
+//   --allow <sha256> [threat] [name] allow one exact file (terminal, admin prompt)
+//   --blocked <sha256> <threat> <name>  "Install blocked" dialog with Allow and retry
+//   --tab quarantine                 the dashboard, opened on the Quarantine tab
 //   <file.deb>                       MIME handler (Nemo) ⇒ installer, evaluate-and-install
 //   (default)                        the dashboard
 
@@ -1752,6 +2259,15 @@ fn main() {
         }
         std::process::exit(2);
     }
+
+    if args.get(1).map(|s| s == "--allow").unwrap_or(false) {
+        std::process::exit(allow::cli_allow(&args[2..]));
+    }
+    if args.get(1).map(|s| s == "--blocked").unwrap_or(false) {
+        std::process::exit(allow::run_blocked_dialog(&args[2..]));
+    }
+    let on_quarantine = args.windows(2).any(|w| w[0] == "--tab" && w[1] == "quarantine");
+    START_ON_QUARANTINE.with(|c| c.set(on_quarantine));
 
     // .deb MIME handler — Nemo passes file:///path. Standalone ⇒ evaluate-and-install.
     if args.len() > 1 && !args[1].starts_with("--") {

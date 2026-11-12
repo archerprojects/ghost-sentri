@@ -1,11 +1,11 @@
-# gui/Cargo.toml — v1.0
+# gui/Cargo.toml — v1.1.0 — Thursday 12 November 2026
 # ghost-sentri (user-facing binary): on-demand dashboard + installer UI.
 # Links GTK4/libadwaita via relm4. NOT resident — launched on demand, exits on close.
 # No ksni (tray moved to daemon), no zbus, no backend deps.
 
 [package]
 name = "ghost-sentri-gui"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2021"
 description = "Ghost Sentri dashboard and installer UI."
 license = "GPL-3.0-only"

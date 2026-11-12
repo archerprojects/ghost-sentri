@@ -1,4 +1,4 @@
-// src/backends/wrapper.rs — v1.1
+// src/backends/wrapper.rs — v1.1.0 — Thursday 12 November 2026
 // Shell wrapper backend
 // Fix: generate_wrapper_block no longer passes unused `socket` arg to format!
 // The shell wrappers call ghost-sentri directly; socket path is resolved by the binary

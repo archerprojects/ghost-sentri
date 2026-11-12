@@ -1,4 +1,4 @@
-// daemon/src/session.rs
+// daemon/src/session.rs — v1.1.0 — Thursday 12 November 2026
 // Resolve the live LOCAL graphical session so the root apt-hook can launch the
 // review GUI INTO it — same session the user is already logged into. No relogin,
 // no autostart, no per-user daemon. This is what makes terminal `sudo apt` show
@@ -25,6 +25,16 @@ pub struct Session {
 /// First active x11/wayland session with a resolvable display environment, or
 /// None (→ caller falls back to TTY review or policy).
 pub fn resolve_active_graphical() -> Option<Session> {
+    resolve(None)
+}
+
+/// The active x11/wayland session of one user (Downloads watch notices go to
+/// the owner of the folder, nobody else), or None if that user has none.
+pub fn resolve_for_uid(uid: u32) -> Option<Session> {
+    resolve(Some(uid))
+}
+
+fn resolve(only_uid: Option<u32>) -> Option<Session> {
     for sid in list_sessions() {
         let props = show_session(&sid);
         let active = props.get("Active").map(|v| v == "yes").unwrap_or(false);
@@ -36,6 +46,9 @@ pub fn resolve_active_graphical() -> Option<Session> {
             Some(u) => u,
             None => continue,
         };
+        if only_uid.is_some_and(|want| want != uid) {
+            continue;
+        }
         let leader: Option<i32> = props.get("Leader").and_then(|v| v.parse().ok());
         let (user, home, gid) = match passwd(uid) {
             Some(t) => t,

@@ -1,4 +1,4 @@
-// core/src/clam/mod.rs
+// core/src/clam/mod.rs — v1.1.0 — Thursday 12 November 2026
 // Scan engine: system `clamscan` subprocess (no C FFI).
 // Definition status: filesystem stat of daily.cvd/.cld mtime — no network calls.
 // Definition updates: the root system daemon runs `freshclam` directly after a
@@ -8,6 +8,11 @@
 // `.deb` scans route through a size-capped loopback image (the decompression-bomb
 // fence, see LoopMount); `sweep_stale_scratch()` closes any fence debris a crash
 // leaked and is called once at daemon start.
+//
+// `scan_batch()` scans many files in ONE clamscan run (one database load) and
+// attributes every hit to its file; the Downloads watch uses it. Every FOUND line
+// is collected — a scan never stops at the first hit. `ScanLock` keeps clamscan
+// runs from different processes (daemon, install worker) from overlapping.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -356,46 +361,50 @@ impl SystemClamBackend {
     /// Map a clamscan exit code + output to a ScanResult (shared by file and
     /// stream scans). 0 = clean, 1 = infected, 2 = error.
     fn parse_scan(&self, code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> ScanResult {
-        let stdout = String::from_utf8_lossy(stdout);
-        let stderr = String::from_utf8_lossy(stderr);
         let def_ver = self.get_definition_version().unwrap_or_default();
-        match code {
-            Some(0) => ScanResult::Clean,
-            Some(1) => {
-                for line in stdout.lines() {
-                    if line.ends_with("FOUND") {
-                        // A tripped scan fence (via --alert-exceeds-max) is NOT
-                        // malware — it means a member was too large or too deeply
-                        // nested to fully scan. Surface it as an error so it fails
-                        // closed as `unscannable` (block/review) with honest
-                        // wording, rather than masquerading as a signature hit.
-                        if line.contains("Heuristics.Limits.Exceeded") {
-                            return ScanResult::Error(
-                                "a package member exceeded scan limits (too large \
-                                 or too deeply nested to fully scan)"
-                                    .to_string(),
-                            );
-                        }
-                        if let Some(detail) =
-                            ThreatDetail::from_clamscan_line(line, &def_ver, "daily.cvd")
-                        {
-                            return ScanResult::Threat(detail);
-                        }
-                    }
-                }
-                ScanResult::Threat(ThreatDetail {
-                    name:               "Unknown".to_string(),
-                    classification:     ThreatClassification::Unknown,
-                    database:           "unknown".to_string(),
-                    definition_version: def_ver,
-                    plain_english:      stdout.to_string(),
-                })
-            }
-            Some(2) => ScanResult::Error(format!(
-                "clamscan error: {}",
-                if !stderr.is_empty() { &stderr } else { &stdout }
-            )),
-            _ => ScanResult::Error("clamscan returned unexpected exit code".to_string()),
+        parse_single(code, &String::from_utf8_lossy(stdout), &String::from_utf8_lossy(stderr), &def_ver)
+    }
+
+    /// Scan many regular files in ONE clamscan run and return one verdict per
+    /// file, in the same order. `low_priority` runs clamscan under `nice -n 10`
+    /// and `ionice -c2 -n7` (lowest best-effort, never the idle class). clamscan's
+    /// own unpacking goes to a private dir under /var/tmp/ghost-sentri, removed
+    /// afterwards.
+    pub fn scan_batch(&self, files: &[PathBuf], low_priority: bool) -> Vec<FileVerdict> {
+        if files.is_empty() {
+            return vec![];
+        }
+        let base = scan_tempdir_base();
+        let tmp = make_scan_dir(&base);
+        let mut cmd = if low_priority {
+            let mut c = Command::new("nice");
+            c.args(["-n", "10", "ionice", "-c2", "-n7"]).arg(&self.clamscan_path);
+            c
+        } else {
+            Command::new(&self.clamscan_path)
+        };
+        cmd.args(["--no-summary", "--infected"]).args(SCAN_LIMITS);
+        if let Some(t) = &tmp {
+            cmd.arg(format!("--tempdir={}", t.display()));
+        }
+        cmd.arg("--").args(files);
+        let out = cmd.output();
+        if let Some(t) = &tmp {
+            let _ = std::fs::remove_dir_all(t);
+        }
+        let def_ver = self.get_definition_version().unwrap_or_default();
+        match out {
+            Err(e) => files
+                .iter()
+                .map(|_| FileVerdict::Error(format!("clamscan failed to launch: {e}")))
+                .collect(),
+            Ok(o) => parse_batch(
+                files,
+                o.status.code(),
+                &String::from_utf8_lossy(&o.stdout),
+                &String::from_utf8_lossy(&o.stderr),
+                &def_ver,
+            ),
         }
     }
 
@@ -406,6 +415,209 @@ impl SystemClamBackend {
             .context("could not run clamscan --version")?;
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Output parsing — every FOUND line counts
+// ─────────────────────────────────────────────────────────────────────────────
+
+const LIMITS_SIG: &str = "Heuristics.Limits.Exceeded";
+
+fn limits_msg() -> String {
+    "a package member exceeded scan limits (too large or too deeply nested to fully scan)".to_string()
+}
+
+/// One file's verdict from a batch scan.
+#[derive(Debug, Clone)]
+pub enum FileVerdict {
+    Clean,
+    Threat(ThreatDetail),
+    /// A scan fence tripped (`Heuristics.Limits.Exceeded`): not malware, but not
+    /// fully scanned either.
+    LimitsExceeded,
+    Error(String),
+}
+
+/// Single-target parse. A real signature anywhere in the output wins over a
+/// tripped limit; a tripped limit alone is an error (fail closed, honest wording).
+pub fn parse_single(code: Option<i32>, stdout: &str, stderr: &str, def_ver: &str) -> ScanResult {
+    match code {
+        Some(0) => ScanResult::Clean,
+        Some(1) => {
+            let mut limits = false;
+            for line in stdout.lines() {
+                if !line.ends_with("FOUND") {
+                    continue;
+                }
+                if line.contains(LIMITS_SIG) {
+                    limits = true;
+                    continue;
+                }
+                if let Some(detail) = ThreatDetail::from_clamscan_line(line, def_ver, "daily.cvd") {
+                    return ScanResult::Threat(detail);
+                }
+            }
+            if limits {
+                return ScanResult::Error(limits_msg());
+            }
+            ScanResult::Threat(ThreatDetail {
+                name:               "Unknown".to_string(),
+                classification:     ThreatClassification::Unknown,
+                database:           "unknown".to_string(),
+                definition_version: def_ver.to_string(),
+                plain_english:      stdout.to_string(),
+            })
+        }
+        Some(2) => ScanResult::Error(format!(
+            "clamscan error: {}",
+            if !stderr.is_empty() { stderr } else { stdout }
+        )),
+        _ => ScanResult::Error("clamscan returned unexpected exit code".to_string()),
+    }
+}
+
+/// Which of `files` a clamscan output line is about: the longest `"<path>: "`
+/// prefix (a path may itself contain ": ").
+fn attribute<'a>(files: &[PathBuf], line: &'a str) -> Option<(usize, &'a str)> {
+    let mut best: Option<(usize, usize)> = None;
+    for (i, f) in files.iter().enumerate() {
+        let prefix = format!("{}: ", f.display());
+        if line.starts_with(&prefix) && best.is_none_or(|(_, l)| prefix.len() > l) {
+            best = Some((i, prefix.len()));
+        }
+    }
+    best.map(|(i, l)| (i, &line[l..]))
+}
+
+/// Batch parse: one verdict per file, same order as `files`.
+pub fn parse_batch(
+    files: &[PathBuf],
+    code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    def_ver: &str,
+) -> Vec<FileVerdict> {
+    let mut v: Vec<Option<FileVerdict>> = vec![None; files.len()];
+    let mut any_attributed_error = false;
+
+    for line in stdout.lines() {
+        let Some((i, rest)) = attribute(files, line) else { continue };
+        let rest = rest.trim();
+        if let Some(name) = rest.strip_suffix(" FOUND") {
+            let name = name.trim();
+            if name.contains(LIMITS_SIG) {
+                if !matches!(v[i], Some(FileVerdict::Threat(_))) {
+                    v[i] = Some(FileVerdict::LimitsExceeded);
+                }
+            } else if !matches!(v[i], Some(FileVerdict::Threat(_))) {
+                let classification = ThreatClassification::from_name(name);
+                v[i] = Some(FileVerdict::Threat(ThreatDetail {
+                    name:               name.to_string(),
+                    plain_english:      classification.plain_english(name),
+                    classification,
+                    database:           "daily.cvd".to_string(),
+                    definition_version: def_ver.to_string(),
+                }));
+            }
+        } else if v[i].is_none() {
+            v[i] = Some(FileVerdict::Error(rest.trim_end_matches(" ERROR").to_string()));
+            any_attributed_error = true;
+        }
+    }
+    for line in stderr.lines() {
+        let l = line.strip_prefix("WARNING: ").unwrap_or(line);
+        if let Some((i, rest)) = attribute(files, l) {
+            if v[i].is_none() {
+                v[i] = Some(FileVerdict::Error(rest.trim().to_string()));
+                any_attributed_error = true;
+            }
+        }
+    }
+
+    // Files with no line of their own: clean on a normal exit, or when exit 2 is
+    // explained by per-file errors. Otherwise the run itself failed.
+    let run_ok = matches!(code, Some(0) | Some(1)) || (code == Some(2) && any_attributed_error);
+    let run_err = || {
+        let msg = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("clamscan did not complete");
+        FileVerdict::Error(format!("clamscan error: {msg}"))
+    };
+    v.into_iter()
+        .map(|x| x.unwrap_or_else(|| if run_ok { FileVerdict::Clean } else { run_err() }))
+        .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RAR support — only when libclamunrar matches the installed libclamav
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// True when RAR archives can be scanned: libclamunrarN is installed at the SAME
+/// upstream version as libclamavN. A mismatched or missing library means a .rar
+/// gets the "not scanned" notice instead.
+pub fn rar_supported() -> bool {
+    let out = Command::new("dpkg-query")
+        .args(["-W", "-f=${Package} ${Version} ${db:Status-Abbrev}\\n", "libclamav*", "libclamunrar*"])
+        .stderr(Stdio::null())
+        .output();
+    match out {
+        Ok(o) => rar_supported_from(&String::from_utf8_lossy(&o.stdout)),
+        Err(_) => false,
+    }
+}
+
+/// Upstream part of a Debian version: no epoch, no revision, no +suffix.
+fn upstream(v: &str) -> &str {
+    let v = v.split_once(':').map(|(_, r)| r).unwrap_or(v);
+    let v = v.rsplit_once('-').map(|(l, _)| l).unwrap_or(v);
+    v.split('+').next().unwrap_or(v).split('~').next().unwrap_or(v)
+}
+
+pub fn rar_supported_from(dpkg_query: &str) -> bool {
+    let mut av: Vec<(String, String)> = Vec::new(); // (soname digits, upstream)
+    let mut unrar: Vec<(String, String)> = Vec::new();
+    for line in dpkg_query.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 3 || !f[2].starts_with("ii") {
+            continue;
+        }
+        let (pkg, ver) = (f[0], f[1]);
+        let pkg = pkg.split(':').next().unwrap_or(pkg);
+        // Debian's 64-bit time_t transition renames libfooN to libfooNt64.
+        let pkg = pkg.strip_suffix("t64").unwrap_or(pkg);
+        if let Some(n) = pkg.strip_prefix("libclamunrar") {
+            if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) {
+                unrar.push((n.to_string(), upstream(ver).to_string()));
+            }
+        } else if let Some(n) = pkg.strip_prefix("libclamav") {
+            if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) {
+                av.push((n.to_string(), upstream(ver).to_string()));
+            }
+        }
+    }
+    av.iter().any(|a| unrar.iter().any(|u| u == a))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cross-process scan lock
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SCAN_LOCK_PATH: &str = "/run/ghost-sentri/scan.lock";
+
+/// Held while one clamscan run is in progress. Dropping it releases the lock.
+/// If the lock file cannot be opened (no runtime dir), scanning is not held up.
+pub struct ScanLock {
+    _file: Option<std::fs::File>,
+}
+
+/// Block until no other Ghost Sentri process is running clamscan.
+pub fn acquire_scan_lock() -> ScanLock {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(SCAN_LOCK_PATH)
+        .ok()
+        .and_then(|f| f.lock().ok().map(|_| f));
+    ScanLock { _file: file }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -705,5 +917,71 @@ pub fn sweep_stale_scratch() {
 
     if swept > 0 {
         log::info!("[fence] swept {swept} stale scan-scratch item(s) at start");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn files() -> Vec<PathBuf> {
+        vec![
+            PathBuf::from("/h/Downloads/eicar one.com"),
+            PathBuf::from("/h/Downloads/two: odd.txt"),
+            PathBuf::from("/h/Downloads/clean.txt"),
+            PathBuf::from("/h/Downloads/z.zip"),
+            PathBuf::from("/h/Downloads/missing.bin"),
+        ]
+    }
+
+    #[test]
+    fn batch_attributes_every_hit() {
+        // Real clamscan 1.5.4 output for these five files.
+        let out = "/h/Downloads/eicar one.com: Eicar-Test-Signature FOUND\n\
+                   /h/Downloads/two: odd.txt: Eicar-Test-Signature FOUND\n\
+                   /h/Downloads/z.zip: Eicar-Test-Signature FOUND\n\
+                   /h/Downloads/missing.bin: No such file or directory\n";
+        let err = "WARNING: /h/Downloads/missing.bin: Can't access file\n";
+        let v = parse_batch(&files(), Some(1), &out.replace("                   ", ""), err, "v");
+        assert!(matches!(&v[0], FileVerdict::Threat(d) if d.name == "Eicar-Test-Signature"));
+        assert!(matches!(&v[1], FileVerdict::Threat(_)));
+        assert!(matches!(&v[2], FileVerdict::Clean));
+        assert!(matches!(&v[3], FileVerdict::Threat(_)));
+        assert!(matches!(&v[4], FileVerdict::Error(_)));
+    }
+
+    #[test]
+    fn batch_limits_and_run_failure() {
+        let f = files();
+        let out = format!("{}: Heuristics.Limits.Exceeded.MaxFileSize FOUND\n", f[2].display());
+        let v = parse_batch(&f, Some(1), &out, "", "v");
+        assert!(matches!(v[2], FileVerdict::LimitsExceeded));
+        assert!(matches!(v[0], FileVerdict::Clean));
+        // Exit 2 with nothing attributed: the run failed, nobody is clean.
+        let v = parse_batch(&f, Some(2), "", "LibClamAV Error: cli_loaddb(): No supported database files found\n", "v");
+        assert!(v.iter().all(|x| matches!(x, FileVerdict::Error(_))));
+        // Killed by a signal.
+        let v = parse_batch(&f, None, "", "", "v");
+        assert!(v.iter().all(|x| matches!(x, FileVerdict::Error(_))));
+    }
+
+    #[test]
+    fn single_prefers_real_threat_over_limits() {
+        let out = "/x/a: Heuristics.Limits.Exceeded.MaxScanSize FOUND\n/x/b: Win.Trojan.Agent-1 FOUND\n";
+        assert!(matches!(parse_single(Some(1), out, "", "v"), ScanResult::Threat(d) if d.name == "Win.Trojan.Agent-1"));
+        let out = "/x/a: Heuristics.Limits.Exceeded.MaxScanSize FOUND\n";
+        assert!(matches!(parse_single(Some(1), out, "", "v"), ScanResult::Error(_)));
+    }
+
+    #[test]
+    fn rar_needs_matching_versions() {
+        let this_host = "libclamav12:amd64 1.5.4+dfsg-0ubuntu0.24.04.1 ii \n";
+        assert!(!rar_supported_from(this_host));
+        let mismatch = format!("{this_host}libclamunrar12:amd64 1.3.1-0ubuntu0.24.04.1 ii \n");
+        assert!(!rar_supported_from(&mismatch));
+        let ok = format!("{this_host}libclamunrar12:amd64 1.5.4-0ubuntu0.24.04.1 ii \n");
+        assert!(rar_supported_from(&ok));
+        let removed = format!("{this_host}libclamunrar12:amd64 1.5.4-1 rc \n");
+        assert!(!rar_supported_from(&removed));
     }
 }

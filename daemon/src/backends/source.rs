@@ -1,4 +1,4 @@
-// src/backends/source.rs — v1.0
+// src/backends/source.rs — v1.1.0 — Thursday 12 November 2026
 // Build-from-source intercept backend
 //
 // Monitors for source install commands run with elevated privileges:

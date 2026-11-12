@@ -1,4 +1,4 @@
-// core/src/deb_inspect.rs
+// core/src/deb_inspect.rs — v1.1.0 — Thursday 12 November 2026
 // Unprivileged pre-install inspection of a .deb. Pure `dpkg-deb` / `dpkg` / apt
 // simulation — NO root, NO GTK. Produces a DebReport the GUI renders on the
 // review screen BEFORE the single polkit elevation, so the user authorises a

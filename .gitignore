@@ -21,3 +21,6 @@
 # ── Stray build output / cargo-fix backups ──────────────────
 *.deb
 *.rs.bk
+
+# ── Node ──────────────────────────────────────────────────────
+node_modules/

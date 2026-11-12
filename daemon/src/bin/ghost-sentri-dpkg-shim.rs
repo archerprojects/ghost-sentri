@@ -1,4 +1,4 @@
-// ghost-sentri-dpkg-shim — v1.0
+// ghost-sentri-dpkg-shim — v1.1.0 — Thursday 12 November 2026
 // PATH shim installed at /usr/local/sbin/dpkg (ahead of /usr/bin in sudoers
 // secure_path). It catches LOCAL .deb installs that bypass apt's
 // Pre-Install-Pkgs hook — notably `nala install ./x.deb` and direct

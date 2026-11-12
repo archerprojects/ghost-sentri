@@ -1,4 +1,4 @@
-// daemon/src/backends/snap.rs — v1.0
+// daemon/src/backends/snap.rs — v1.1.0 — Thursday 12 November 2026
 // Snap install monitor — DETECT-AND-LOG ONLY.
 //
 // IMPORTANT, by design: snapd exposes no pre-install gate a third party can hold

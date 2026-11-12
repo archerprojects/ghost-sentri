@@ -1,5 +1,5 @@
 #!/bin/sh
-# debian/postrm
+# debian/postrm — v1.1.0 — Thursday 12 November 2026
 # On removal/purge, stop+disable the system service and undo machine policy the
 # daemon may have written:
 #   - apt hook

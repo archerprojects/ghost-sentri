@@ -1,4 +1,4 @@
-// daemon/src/polkit.rs
+// daemon/src/polkit.rs — v1.1.0 — Thursday 12 November 2026
 // Authorize a control-socket caller via polkit's D-Bus API, the same mechanism
 // packagekitd / udisks2 use. The daemon runs as root (systemd system service);
 // it does NOT use pkexec. Instead, for each privileged request it identifies the

@@ -1,4 +1,6 @@
-// daemon/src/backends/mod.rs
+// daemon/src/backends/mod.rs — v1.1.0 — Thursday 12 November 2026
+// 1.1.0: the Wine and Flatpak monitors are retired; the Downloads watch replaces
+// them (a .exe/.msi/.flatpak saved to Downloads is scanned there).
 // Split notes:
 //   - Lives in the `daemon` crate; shared types come from ghost_sentri_core.
 //   - Snap backend (detect-and-log; snapd permits no pre-install gate) — a real
@@ -10,10 +12,9 @@
 //     task handles so a monitor toggle can actually start/stop a backend at runtime.
 
 pub mod apt;
-pub mod flatpak_backend;
+pub mod downloads;
 pub mod snap;
 pub mod source;
-pub mod wine;
 pub mod wrapper;
 
 use anyhow::Result;
@@ -32,8 +33,7 @@ use tokio::task::JoinHandle;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BackendKind {
     Apt,
-    Flatpak,
-    Wine,
+    Downloads,
     BuildSource,
     Wrapper,
     Snap,
@@ -43,8 +43,7 @@ impl fmt::Display for BackendKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BackendKind::Apt         => write!(f, "APT Hook"),
-            BackendKind::Flatpak     => write!(f, "Flatpak"),
-            BackendKind::Wine         => write!(f, "Wine"),
+            BackendKind::Downloads   => write!(f, "Downloads"),
             BackendKind::BuildSource => write!(f, "Build Source"),
             BackendKind::Wrapper     => write!(f, "Wrapper"),
             BackendKind::Snap         => write!(f, "Snap"),
@@ -57,8 +56,7 @@ impl BackendKind {
     pub fn id(&self) -> &'static str {
         match self {
             BackendKind::Apt         => "apt",
-            BackendKind::Flatpak     => "flatpak",
-            BackendKind::Wine         => "wine",
+            BackendKind::Downloads   => "downloads",
             BackendKind::BuildSource => "source",
             BackendKind::Wrapper     => "wrapper",
             BackendKind::Snap         => "snap",
@@ -70,8 +68,7 @@ impl BackendKind {
         let b = &config.backends;
         match self {
             BackendKind::Apt         => b.enable_apt,
-            BackendKind::Flatpak     => b.enable_flatpak,
-            BackendKind::Wine         => b.enable_wine,
+            BackendKind::Downloads   => b.enable_downloads,
             BackendKind::BuildSource => b.enable_build_source,
             BackendKind::Wrapper     => b.enable_wrapper,
             BackendKind::Snap         => b.enable_snap,
@@ -86,13 +83,10 @@ impl BackendKind {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // metadata consumed by the dashboard (stage 3)
 pub enum BackendExtra {
-    Flatpak {
-        signed:      bool,
-        publisher:   Option<String>,
-        key_trusted: bool,
-    },
-    Wine {
-        wine_binary: PathBuf,
+    /// Downloads watch report. `quarantined` tells the daemon to broadcast
+    /// QuarantineUpdated so open dashboards refresh.
+    Downloads {
+        quarantined: bool,
     },
     BuildSource {
         command:    String,
@@ -140,6 +134,13 @@ pub struct PackageVerdict {
     /// the user-facing reason. Distinct from `inspect_failed` (heuristic-only,
     /// advisory → review) and from `threat` (a positive signature hit).
     pub unscannable: Option<String>,
+    /// SHA256 of the package file, when it could be computed. Printed in the
+    /// block message so the user can allow this exact file.
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// The hash is on the allow list: ClamAV was skipped for this file.
+    #[serde(default)]
+    pub allowed: bool,
 }
 
 impl PackageVerdict {
@@ -190,11 +191,14 @@ pub struct InterceptEvent {
     /// TTY review over SSH, or policy when unattended) and decides proceed/cancel.
     pub hook_respond: Option<oneshot::Sender<ScanVerdict>>,
     pub extra:        Option<BackendExtra>,
+    /// A ready-made dashboard log line (Downloads watch reports). When set, the
+    /// daemon logs it as-is instead of the generic "[Detected]" line.
+    pub note:         Option<String>,
 }
 
 impl InterceptEvent {
     pub fn new(path: PathBuf, backend: BackendKind) -> Self {
-        Self { path, backend, bulk_paths: vec![], hook_respond: None, extra: None }
+        Self { path, backend, bulk_paths: vec![], hook_respond: None, extra: None, note: None }
     }
 
     pub fn filename(&self) -> String {
@@ -227,10 +231,8 @@ fn make_backend(kind: &BackendKind, config: &Config) -> Option<Box<dyn Intercept
     match kind {
         BackendKind::Apt =>
             Some(Box::new(apt::AptBackend::new(config.sentry.hook_socket_path.clone()))),
-        BackendKind::Flatpak =>
-            Some(Box::new(flatpak_backend::FlatpakBackend::new(config.sentry.trusted_gpg_keys.clone()))),
-        BackendKind::Wine =>
-            Some(Box::new(wine::WineBackend::new(config.sentry.hook_socket_path.clone()))),
+        BackendKind::Downloads =>
+            Some(Box::new(downloads::DownloadsBackend::new(config.clone()))),
         BackendKind::BuildSource =>
             Some(Box::new(source::SourceBackend::new(config.sentry.hook_socket_path.clone()))),
         BackendKind::Snap =>
@@ -245,8 +247,7 @@ fn make_backend(kind: &BackendKind, config: &Config) -> Option<Box<dyn Intercept
 /// the apt.conf.d hook FILE (root-gated), not this socket.
 pub fn managed_kinds() -> Vec<BackendKind> {
     vec![
-        BackendKind::Flatpak,
-        BackendKind::Wine,
+        BackendKind::Downloads,
         BackendKind::BuildSource,
         BackendKind::Snap,
     ]

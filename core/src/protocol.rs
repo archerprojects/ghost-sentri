@@ -1,4 +1,4 @@
-// core/src/protocol.rs
+// core/src/protocol.rs — v1.1.0 — Thursday 12 November 2026
 // Canonical wire types for every channel in the split architecture.
 //
 // There are THREE channels, at two trust levels:
@@ -37,10 +37,12 @@ use serde::{Deserialize, Serialize};
 pub enum Avenue {
     Apt,        // apt / dpkg / gdebi / Synaptic — caught by the apt.conf.d hook
     Nemo,       // file-manager double-click (MIME handler) — same dpkg family
-    Flatpak,
+    Flatpak,    // retired monitor — kept so older audit lines still parse
     Snap,       // detect-and-log only — snapd does not permit pre-install gating
-    Wine,
+    Wine,       // retired monitor — kept so older audit lines still parse
     Source,     // make install / curl|bash — disabled by default
+    Downloads,  // Downloads watch
+    Dashboard,  // a change made from the dashboard (allow list, settings)
 }
 
 /// How the worker should treat an install request.
@@ -101,6 +103,13 @@ pub enum ControlRequest {
     /// apt-hook intercept proceeds without scanning (still logged). Resets to
     /// active on the next daemon start (login).
     SetActive { active: bool },
+    /// Add one exact file (by SHA256) to the machine-wide allow list. Polkit-gated.
+    AllowHash { sha256: String, threat: String, filename: String },
+    /// Remove an allow-list entry. Polkit-gated.
+    RemoveAllow { sha256: String },
+    /// Downloads watch settings: extra folders and the quarantine location, both
+    /// relative to each user's home. Polkit-gated; existing quarantines move.
+    SetDownloadSettings { folders: Vec<String>, quarantine_dir: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +142,14 @@ pub enum ControlEvent {
     DefinitionUpdateComplete { success: bool },
     /// Result of an InstallWrappers request.
     WrappersInstalled { ok: bool, message: String },
+    /// Outcome of AllowHash / RemoveAllow for `sha256`.
+    AllowResult { sha256: String, ok: bool, message: String },
+    /// The allow list file changed — re-read it.
+    AllowListChanged,
+    /// A user's quarantine changed (new item) — re-read the manifest.
+    QuarantineUpdated,
+    /// Outcome of SetDownloadSettings.
+    SettingsResult { ok: bool, message: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

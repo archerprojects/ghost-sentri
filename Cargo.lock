@@ -572,6 +572,7 @@ dependencies = [
  "env_logger",
  "ghost-sentri-core",
  "ksni",
+ "libc",
  "log",
  "notify",
  "serde",
@@ -581,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-sentri-gui"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",

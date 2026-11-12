@@ -1,4 +1,4 @@
-# daemon/Cargo.toml
+# daemon/Cargo.toml — v1.1.0 — Thursday 12 November 2026
 # ghost-sentri-daemon (resident, headless) + ghost-sentri-installer (privileged worker).
 # No GTK, no relm4. No zbus / futures-util (no D-Bus backend in the build).
 
@@ -41,3 +41,6 @@ log         = "0.4"
 env_logger  = "0.11"
 # polkit CheckAuthorization over the system bus (also pulled transitively by ksni).
 dbus        = "0.9"
+# O_NONBLOCK / O_NOFOLLOW opens and getuid for the Downloads watch (already in the
+# lock file through tokio).
+libc        = "0.2"

@@ -1,7 +1,10 @@
-// gui/src/control.rs — v2.0
+// gui/src/control.rs — v1.1.0 — Thursday 12 November 2026
 // Control-socket client. Runs on the GUI's dedicated tokio runtime (crate::rt()),
 // NOT on the relm4/GTK thread. Connects to the daemon's control socket, subscribes,
 // forwards every ControlEvent into the dashboard, and drains ControlRequests back.
+//
+// v1.1.0: `request_once` — a short-lived connection for one request and its
+// answer (allow-list commands from the terminal and the "Install blocked" dialog).
 //
 // v2.0: single select loop (reader + writer share one connection), explicit phase
 // logging so connection problems are visible in the dashboard log, and automatic
@@ -89,4 +92,52 @@ pub fn connect(
     });
 
     req_tx
+}
+
+/// Connect, send one request, and wait (up to `wait`) for the first event that
+/// `pick` accepts. Used outside the dashboard, where no live connection exists.
+pub async fn request_once<T>(
+    socket_path: &std::path::Path,
+    req: ControlRequest,
+    wait: Duration,
+    pick: impl Fn(&ControlEvent) -> Option<T>,
+) -> Result<T, String> {
+    let stream = UnixStream::connect(socket_path)
+        .await
+        .map_err(|e| format!("cannot reach the Ghost Sentri daemon ({e})"))?;
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let line = to_line(&req).map_err(|e| e.to_string())?;
+    write_half.write_all(line.as_bytes()).await.map_err(|e| e.to_string())?;
+    let mut lines = BufReader::new(read_half).lines();
+    let read = async {
+        while let Ok(Some(l)) = lines.next_line().await {
+            if let Ok(ev) = from_line::<ControlEvent>(&l) {
+                if let Some(t) = pick(&ev) {
+                    return Ok(t);
+                }
+            }
+        }
+        Err("the daemon closed the connection".to_string())
+    };
+    tokio::time::timeout(wait, read).await.map_err(|_| "no answer from the daemon".to_string())?
+}
+
+/// Ask the daemon to allow one exact file. Ok((approved, message)).
+pub async fn request_allow(
+    socket_path: &std::path::Path,
+    sha256: String,
+    threat: String,
+    filename: String,
+) -> Result<(bool, String), String> {
+    let want = sha256.to_ascii_lowercase();
+    request_once(
+        socket_path,
+        ControlRequest::AllowHash { sha256, threat, filename },
+        Duration::from_secs(300), // the user may take a while at the password prompt
+        move |ev| match ev {
+            ControlEvent::AllowResult { sha256, ok, message } if *sha256 == want => Some((*ok, message.clone())),
+            _ => None,
+        },
+    )
+    .await
 }

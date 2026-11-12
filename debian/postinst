@@ -1,5 +1,5 @@
 #!/bin/sh
-# debian/postinst
+# debian/postinst — v1.1.0 — Thursday 12 November 2026
 # Ghost Sentri runs as a ROOT systemd system service. The service starts at
 # install and stays up, but it is INERT — no .deb handler, no apt hook, no
 # monitors — until the user enables scanners from the dashboard. Enabling fires

@@ -1,4 +1,4 @@
-// daemon/src/apply.rs
+// daemon/src/apply.rs — v1.1.0 — Thursday 12 November 2026
 // Root-side commit of machine policy. The daemon now runs as a root systemd
 // SYSTEM service, so it calls `apply_config()` IN-PROCESS after authorising the
 // caller via polkit — there is no per-op pkexec anymore. The `run_apply()` CLI
@@ -73,8 +73,7 @@ fn set_flag(cfg: &mut Config, id: &str, on: bool) {
     let b = &mut cfg.backends;
     match id {
         "apt"        => b.enable_apt = on,
-        "flatpak"    => b.enable_flatpak = on,
-        "wine"       => b.enable_wine = on,
+        "downloads"  => b.enable_downloads = on,
         "source"     => b.enable_build_source = on,
         "wrapper"    => b.enable_wrapper = on,
         "snap"       => b.enable_snap = on,

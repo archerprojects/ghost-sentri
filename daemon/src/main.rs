@@ -1,4 +1,4 @@
-// daemon/src/main.rs
+// daemon/src/main.rs — v1.1.0 — Thursday 12 November 2026
 // ghost-sentri-daemon — resident, headless intercept daemon.
 //
 // Runs as a ROOT systemd SYSTEM service (ghost-sentri-daemon.service). Privileged
@@ -14,6 +14,11 @@
 //   --apply          manual/offline root commit: write /etc config, apt hook,
 //                    .deb MIME, optional freshclam — then exit. The LIVE path is
 //                    apply::apply_config() called in-process by the daemon.
+//   --quarantine-move <dir> <file> <threat> <defs> <sha256>
+//   --quarantine-relocate <old-dir> <new-dir>
+//                    Downloads-watch helpers. The daemon runs these as the USER
+//                    (uid/gid switched, never root), so a planted symlink can't
+//                    trick root into moving or chmod-ing a file. Refuse uid 0.
 //
 // Runtime: multi-thread tokio (2 workers). The daemon's work is socket I/O plus
 // the occasional spawned subprocess; blocking work goes to the blocking pool.
@@ -21,7 +26,9 @@
 mod apply;
 mod backends;
 mod daemon;
+mod notice;
 mod polkit;
+mod scan_slot;
 mod session;
 mod tray;
 
@@ -51,6 +58,11 @@ async fn main() {
             i += 1;
         }
         std::process::exit(apply::run_apply(enable, disable, update_defs));
+    }
+
+    // Quarantine helpers — run as the file's owner by the Downloads watch.
+    if let Some(mode) = args.get(1).filter(|s| *s == "--quarantine-move" || *s == "--quarantine-relocate") {
+        std::process::exit(quarantine_helper(mode, &args[2..]));
     }
 
     // apt.conf.d pre-install hook.
@@ -83,6 +95,36 @@ async fn main() {
     if let Err(e) = daemon::GhostDaemon::new(config).run().await {
         log::error!("daemon exited with error: {e}");
         std::process::exit(1);
+    }
+}
+
+/// `--quarantine-move` / `--quarantine-relocate`. Prints the new record as JSON
+/// (move) and exits 0, or prints the error and exits 1.
+fn quarantine_helper(mode: &str, a: &[String]) -> i32 {
+    use ghost_sentri_core::quarantine;
+    use std::path::Path;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    if unsafe { libc::getuid() } == 0 {
+        eprintln!("refusing to run the quarantine helper as root");
+        return 1;
+    }
+    let res = match (mode, a) {
+        ("--quarantine-move", [dir, file, threat, defs, sha]) => {
+            quarantine::quarantine_file(Path::new(file), Path::new(dir), threat, defs, sha).and_then(|rec| {
+                serde_json::to_string(&rec)
+                    .map(|j| println!("{j}"))
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })
+        }
+        ("--quarantine-relocate", [old, new]) => quarantine::relocate(Path::new(old), Path::new(new)),
+        _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad arguments")),
+    };
+    match res {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
     }
 }
 

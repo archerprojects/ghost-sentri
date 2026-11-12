@@ -1,4 +1,4 @@
-// daemon/src/daemon.rs — v5.0
+// daemon/src/daemon.rs — v1.1.0 — Thursday 12 November 2026
 // Resident, headless daemon. Single source of truth for the dashboard.
 //
 // Architecture (root system service):
@@ -22,9 +22,12 @@
 //   - Installs are NOT performed here — the privileged worker does that. For the
 //     apt-hook path the hook process presents the daemon's headless verdict and
 //     maps the outcome to the held apt transaction's proceed/cancel.
-//   - The daemon does NOT write the /var/log audit file; the root worker writes
-//     install events there during an install. The daemon keeps the live ring for
-//     the dashboard.
+//   - Audit file: the root worker writes install events during an install; the
+//     daemon writes Downloads-watch and allow-list events. The daemon also keeps
+//     the live ring for the dashboard.
+//   - Allow list (allowlist.rs): an allowed file hash skips ClamAV on the apt
+//     path; the heuristics still run. Install scans take the scan slot at
+//     Install priority, ahead of any waiting Downloads batch.
 
 use anyhow::Result;
 use std::collections::{HashMap, VecDeque};
@@ -33,14 +36,17 @@ use std::sync::{Arc, Mutex};
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc};
 
+use ghost_sentri_core::allowlist::{self, AllowEntry, AllowList};
 use ghost_sentri_core::clam::{self, ScanResult, SystemClamBackend};
-use ghost_sentri_core::config::Config;
+use ghost_sentri_core::config::{is_valid_home_relative, Config};
 use ghost_sentri_core::deb_inspect;
+use ghost_sentri_core::events::{self, Action, AuditEvent};
 use ghost_sentri_core::protocol::{
-    ControlEvent, ControlRequest, DefinitionSnapshot, MonitorState,
+    Avenue, ControlEvent, ControlRequest, DefinitionSnapshot, MonitorState,
 };
 
-use crate::backends::{self, BackendKind, InterceptEvent, PackageVerdict, ScanVerdict};
+use crate::backends::{self, downloads, BackendExtra, BackendKind, InterceptEvent, PackageVerdict, ScanVerdict};
+use crate::scan_slot::{self, Priority};
 use crate::tray::{self, TrayCommand};
 
 const LOG_RING_CAP: usize = 500;
@@ -136,8 +142,6 @@ impl GhostDaemon {
             self.spawn_control_accept(listener);
         }
 
-        self.ensure_quarantine().await;
-
         // Close any fence scratch a prior crash leaked (mounts/images under the scan
         // base) before the first scan can provision a new one.
         clam::sweep_stale_scratch();
@@ -229,9 +233,15 @@ impl GhostDaemon {
                     self.log(verdict_summary(&event.filename(), &verdict));
                     let _ = tx.send(verdict);
                 }
-                // Non-blocking detection (flatpak/wine/snap) → log only (live ring).
+                // Non-blocking reports (Downloads watch, snap, source) → live ring.
                 None => {
-                    self.log(format!("[Detected] {} — {}", event.backend, event.filename()));
+                    match event.note.take() {
+                        Some(note) => self.log(note),
+                        None => self.log(format!("[Detected] {} — {}", event.backend, event.filename())),
+                    }
+                    if matches!(event.extra, Some(BackendExtra::Downloads { quarantined: true })) {
+                        let _ = self.events_tx.send(ControlEvent::QuarantineUpdated);
+                    }
                 }
             }
         }
@@ -357,12 +367,6 @@ impl GhostDaemon {
         });
     }
 
-    async fn ensure_quarantine(&self) {
-        let q = self.state.lock().unwrap().config.quarantine.path.clone();
-        if !q.exists() {
-            let _ = tokio::fs::create_dir_all(&q).await;
-        }
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -397,37 +401,37 @@ fn verdict_cache() -> &'static Mutex<std::collections::HashMap<String, (ScanResu
     CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
-/// sha256 of a file via `sha256sum` (no new dependency — matches the subprocess
-/// idiom used for clamscan/dpkg-deb/df). `None` if it can't be computed, in which
-/// case the caller scans uncached rather than risk a wrong key.
-fn deb_hash(path: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new("sha256sum").arg(path).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .next()
-        .map(|h| h.to_string())
+/// ClamAV scan of one install package under the scan slot (Install priority).
+fn slot_scan(clam: &SystemClamBackend, path: &std::path::Path) -> ScanResult {
+    let _slot = scan_slot::acquire(Priority::Install);
+    clam.scan_file(path)
 }
 
 /// ClamAV scan with short-TTL dedupe. A fresh content-hash hit returns the cached
-/// result (no DB reload); otherwise it scans and records the verdict.
-fn cached_scan(clam: &SystemClamBackend, path: &std::path::Path) -> ScanResult {
-    let key = match deb_hash(path) {
+/// result (no DB reload); otherwise it scans and records the verdict. Returns
+/// (result, sha256, allowed). An allow-listed hash skips ClamAV entirely.
+fn cached_scan(
+    clam: &SystemClamBackend,
+    path: &std::path::Path,
+    allow: &AllowList,
+) -> (ScanResult, Option<String>, bool) {
+    let key = match allowlist::file_sha256(path) {
         Some(k) => k,
-        None => return clam.scan_file(path), // unkeyable → scan, don't cache
+        None => return (slot_scan(clam, path), None, false), // unkeyable → scan, don't cache
     };
+    if allow.contains(&key) {
+        return (ScanResult::Clean, Some(key), true);
+    }
     let now = Instant::now();
 
     if let Ok(mut map) = verdict_cache().lock() {
         map.retain(|_, (_, t)| now.duration_since(*t) < CACHE_TTL); // sweep stale
         if let Some((res, _)) = map.get(&key) {
-            return res.clone(); // fresh hit — no rescan
+            return (res.clone(), Some(key), false); // fresh hit — no rescan
         }
     }
 
-    let res = clam.scan_file(path);
+    let res = slot_scan(clam, path);
 
     // Cache only definitive verdicts; a transient Error must re-scan next time.
     if !matches!(res, ScanResult::Error(_)) {
@@ -439,10 +443,10 @@ fn cached_scan(clam: &SystemClamBackend, path: &std::path::Path) -> ScanResult {
                     map.remove(&oldest);
                 }
             }
-            map.insert(key, (res.clone(), now));
+            map.insert(key.clone(), (res.clone(), now));
         }
     }
-    res
+    (res, Some(key), false)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -454,6 +458,7 @@ fn cached_scan(clam: &SystemClamBackend, path: &std::path::Path) -> ScanResult {
 fn build_verdict(paths: Vec<std::path::PathBuf>, clamscan: std::path::PathBuf, def_path: std::path::PathBuf) -> ScanVerdict {
     let clam = SystemClamBackend::new(clamscan, def_path);
     let medium = deb_inspect::Severity::Medium as u8;
+    let allow = AllowList::load();
     let mut packages = Vec::new();
 
     for path in &paths {
@@ -462,7 +467,7 @@ fn build_verdict(paths: Vec<std::path::PathBuf>, clamscan: std::path::PathBuf, d
         // the package at all (e.g. it could not be extracted to scan) — that is
         // NOT clean: it is captured as `unscannable` and hard-blocked downstream,
         // never silently passed.
-        let scan = cached_scan(&clam, path);
+        let (scan, sha256, allowed) = cached_scan(&clam, path, &allow);
         let (threat, threat_detail) = match &scan {
             ScanResult::Threat(d) => (Some(d.name.clone()), Some(d.plain_english.clone())),
             _ => (None, None),
@@ -501,6 +506,8 @@ fn build_verdict(paths: Vec<std::path::PathBuf>, clamscan: std::path::PathBuf, d
                     adds_apt_source: r.adds_apt_source || r.adds_gpg_key,
                     inspect_failed: false,
                     unscannable,
+                    sha256,
+                    allowed,
                 });
             }
             Err(_) => {
@@ -518,6 +525,8 @@ fn build_verdict(paths: Vec<std::path::PathBuf>, clamscan: std::path::PathBuf, d
                     adds_apt_source: false,
                     inspect_failed: true,
                     unscannable,
+                    sha256,
+                    allowed,
                 });
             }
         }
@@ -533,9 +542,11 @@ fn verdict_summary(filename: &str, v: &ScanVerdict) -> String {
         format!("[Intercept] {} — THREAT: {}", filename, names.join(", "))
     } else {
         let flagged = v.flagged().len();
+        let allowed = v.packages.iter().filter(|p| p.allowed).count();
         format!(
-            "[Intercept] {} — scanned {} pkg(s), {} flagged for review",
+            "[Intercept] {} — scanned {} pkg(s), {} flagged for review{}",
             filename, v.packages.len(), flagged,
+            if allowed > 0 { format!(", {allowed} on the allow list (ClamAV skipped)") } else { String::new() },
         )
     }
 }
@@ -757,7 +768,6 @@ async fn handle_request(
         // Re-read /etc config and reconcile running backend tasks to match it.
         ControlRequest::Reload => handle_reload(state, events_tx, intercept_tx).await,
 
-        // Session scan suspend/resume — RAM-only, no config write, no polkit.
         // Session scan suspend/resume — RAM-only, no config write. Still polkit-gated:
         // the control socket is world-connectable (0666 + per-request polkit), so an
         // ungated suspend would let any local process silently disable install
@@ -778,6 +788,162 @@ async fn handle_request(
                 line: if active { "Install scanning resumed.".into() }
                       else { "Install scanning suspended for this session.".into() },
             });
+        }
+
+        // Allow one exact file by hash — machine-wide, so admin-gated.
+        ControlRequest::AllowHash { sha256, threat, filename } => {
+            let sha = sha256.to_ascii_lowercase();
+            if !allowlist::is_valid_sha256(&sha) {
+                let _ = events_tx.send(ControlEvent::AllowResult {
+                    sha256: sha, ok: false, message: "Not a valid SHA256 hash.".into(),
+                });
+                return;
+            }
+            if !authorize(peer_pid, peer_uid).await {
+                let _ = events_tx.send(ControlEvent::AllowResult {
+                    sha256: sha, ok: false, message: "Authorisation declined — nothing was allowed.".into(),
+                });
+                return;
+            }
+            let user = downloads::user_name(peer_uid);
+            let (s2, t2, f2, u2) = (sha.clone(), threat.clone(), filename.clone(), user.clone());
+            let saved = tokio::task::spawn_blocking(move || {
+                let mut list = AllowList::load();
+                list.add(AllowEntry {
+                    sha256: s2.clone(),
+                    threat: t2.clone(),
+                    filename: f2.clone(),
+                    allowed_by: u2.clone(),
+                    allowed_at: allowlist::now_rfc3339(),
+                });
+                let r = list.save();
+                if r.is_ok() {
+                    let ev = AuditEvent::new(u2, Avenue::Dashboard, Action::Allowed, f2)
+                        .with_detail(format!("sha256 {s2} allowed over {t2}"));
+                    let _ = events::append(&ev);
+                }
+                r
+            }).await;
+            match saved {
+                Ok(Ok(())) => {
+                    if let Ok(mut map) = verdict_cache().lock() { map.remove(&sha); }
+                    let _ = events_tx.send(ControlEvent::LogLine {
+                        line: format!("[Allow] {filename} ({threat}) allowed by {user} — sha256 {sha}"),
+                    });
+                    let _ = events_tx.send(ControlEvent::AllowListChanged);
+                    let _ = events_tx.send(ControlEvent::AllowResult {
+                        sha256: sha, ok: true, message: "Allowed. Re-run your install if one was blocked.".into(),
+                    });
+                }
+                other => {
+                    let msg = match other { Ok(Err(e)) => e.to_string(), _ => "internal error".into() };
+                    let _ = events_tx.send(ControlEvent::AllowResult {
+                        sha256: sha, ok: false, message: format!("Could not save the allow list: {msg}"),
+                    });
+                }
+            }
+        }
+
+        ControlRequest::RemoveAllow { sha256 } => {
+            let sha = sha256.to_ascii_lowercase();
+            if !authorize(peer_pid, peer_uid).await {
+                let _ = events_tx.send(ControlEvent::AllowResult {
+                    sha256: sha, ok: false, message: "Authorisation declined — the entry stays.".into(),
+                });
+                return;
+            }
+            let user = downloads::user_name(peer_uid);
+            let (s2, u2) = (sha.clone(), user.clone());
+            let res = tokio::task::spawn_blocking(move || {
+                let mut list = AllowList::load();
+                let name = list.get(&s2).map(|e| e.filename.clone()).unwrap_or_default();
+                if !list.remove(&s2) {
+                    return Ok(false);
+                }
+                list.save()?;
+                let ev = AuditEvent::new(u2, Avenue::Dashboard, Action::AllowRemoved, name)
+                    .with_detail(format!("sha256 {s2} removed from the allow list"));
+                let _ = events::append(&ev);
+                Ok::<bool, std::io::Error>(true)
+            }).await;
+            let (ok, message) = match res {
+                Ok(Ok(true)) => (true, "Removed from the allow list.".to_string()),
+                Ok(Ok(false)) => (false, "That hash is not on the allow list.".to_string()),
+                Ok(Err(e)) => (false, format!("Could not save the allow list: {e}")),
+                Err(_) => (false, "internal error".to_string()),
+            };
+            if ok {
+                let _ = events_tx.send(ControlEvent::LogLine { line: format!("[Allow] sha256 {sha} removed by {user}") });
+                let _ = events_tx.send(ControlEvent::AllowListChanged);
+            }
+            let _ = events_tx.send(ControlEvent::AllowResult { sha256: sha, ok, message });
+        }
+
+        // Downloads folders + quarantine location. Machine-wide config → admin.
+        ControlRequest::SetDownloadSettings { folders, quarantine_dir } => {
+            let folders: Vec<String> = folders.iter().map(|f| f.trim().to_string()).filter(|f| !f.is_empty()).collect();
+            let qdir = quarantine_dir.trim().to_string();
+            if let Some(bad) = folders.iter().find(|f| !is_valid_home_relative(f)) {
+                let _ = events_tx.send(ControlEvent::SettingsResult {
+                    ok: false, message: format!("\"{bad}\" is not a folder inside the home folder."),
+                });
+                return;
+            }
+            if !is_valid_home_relative(&qdir) {
+                let _ = events_tx.send(ControlEvent::SettingsResult {
+                    ok: false, message: format!("\"{qdir}\" is not a folder inside the home folder."),
+                });
+                return;
+            }
+            if !authorize(peer_pid, peer_uid).await {
+                let _ = events_tx.send(ControlEvent::SettingsResult {
+                    ok: false, message: "Authorisation declined — settings unchanged.".into(),
+                });
+                return;
+            }
+            let res = tokio::task::spawn_blocking(move || {
+                let mut cfg = Config::load().unwrap_or_default();
+                let old = cfg.quarantine.clone();
+                cfg.downloads.folders = folders;
+                cfg.quarantine.dir = qdir;
+                cfg.save().map_err(|e| e.to_string())?;
+                let mut problems = Vec::new();
+                for u in downloads::real_users() {
+                    let (from, to) = (old.dir_for(&u.home), cfg.quarantine.dir_for(&u.home));
+                    if from != to {
+                        if let Err(e) = downloads::relocate_as_user(&u, &from, &to) {
+                            problems.push(format!("{}: {e}", u.name));
+                        }
+                    }
+                }
+                Ok::<Vec<String>, String>(problems)
+            }).await;
+            let (ok, message) = match res {
+                Ok(Ok(p)) if p.is_empty() => (true, "Downloads settings saved.".to_string()),
+                Ok(Ok(p)) => (true, format!("Settings saved, but some quarantines could not be moved: {}", p.join("; "))),
+                Ok(Err(e)) => (false, format!("Could not save settings: {e}")),
+                Err(_) => (false, "internal error".to_string()),
+            };
+            if ok {
+                restart_downloads(state, intercept_tx);
+                let _ = events_tx.send(ControlEvent::QuarantineUpdated);
+            }
+            let _ = events_tx.send(ControlEvent::LogLine { line: message.clone() });
+            let _ = events_tx.send(ControlEvent::SettingsResult { ok, message });
+        }
+    }
+}
+
+/// Re-read config and restart the Downloads watch if it is running, so new
+/// folders and the new quarantine location take effect now.
+fn restart_downloads(state: &Shared, intercept_tx: &mpsc::Sender<InterceptEvent>) {
+    let cfg = Config::load().unwrap_or_default();
+    let mut st = state.lock().unwrap();
+    st.config = cfg.clone();
+    if let Some(h) = st.handles.remove(&BackendKind::Downloads) {
+        h.abort();
+        if let Some(h) = backends::start_backend(&BackendKind::Downloads, intercept_tx.clone(), &cfg) {
+            st.handles.insert(BackendKind::Downloads, h);
         }
     }
 }

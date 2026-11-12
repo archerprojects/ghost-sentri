@@ -1,4 +1,4 @@
-# .cargo/config.toml
+# .cargo/config.toml — v1.1.0 — Thursday 12 November 2026
 # Flatpak builds require offline vendor mode — all crates must be vendored
 # into a vendor/ directory before the Flatpak sandbox cuts network access.
 #

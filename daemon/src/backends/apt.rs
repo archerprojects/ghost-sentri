@@ -1,4 +1,4 @@
-// src/backends/apt.rs — v2.5
+// src/backends/apt.rs — v1.1.0 — Thursday 12 November 2026
 // APT hook socket server — pre-install intercept via dpkg hook
 // InstallRequest from installer.rs passes through without intercept dialog —
 // Ghost Sentri owns that install, daemon runs it directly via pkexec
@@ -314,14 +314,31 @@ fn present_and_decide(v: &ScanVerdict) -> i32 {
         return 0;
     }
 
-    // Hard stop: a signature hit is acted on regardless of context.
+    // Hard stop: a signature hit is acted on regardless of context. A false
+    // positive is overridden only by allowing that exact file's hash (admin),
+    // then re-running the install — never from inside this transaction.
     let threats = v.threats();
     if !threats.is_empty() {
         eprintln!("\nGhost Sentri BLOCKED this install — malware signature detected:");
         for p in &threats {
             eprintln!("    {} {}  →  {}", p.name, p.version, p.threat.as_deref().unwrap_or("threat"));
         }
-        eprintln!("Nothing was installed. See the Ghost Sentri dashboard.\n");
+        eprintln!("Nothing was installed. See the Ghost Sentri dashboard.");
+        let allowable: Vec<&&PackageVerdict> = threats.iter().filter(|p| p.sha256.is_some()).collect();
+        if !allowable.is_empty() {
+            eprintln!("If you are sure this is a false positive, allow that exact file");
+            eprintln!("(administrator approval), then re-run your install:");
+            for p in &allowable {
+                eprintln!(
+                    "    ghost-sentri --allow {} {} {}",
+                    p.sha256.as_deref().unwrap_or_default(),
+                    shell_word(p.threat.as_deref().unwrap_or("threat")),
+                    shell_word(&p.name),
+                );
+            }
+        }
+        eprintln!();
+        offer_allow_dialog(&threats);
         return 1;
     }
 
@@ -399,6 +416,43 @@ fn present_gui(flagged: &[&PackageVerdict], sess: &session::Session) -> i32 {
         }
     }
     0
+}
+
+/// Quote a word for the printed command only when it needs it.
+fn shell_word(s: &str) -> String {
+    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "._-+:@/".contains(c)) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// Open the "Install blocked" dialog (with "Allow and retry") in the live
+/// graphical session, if there is one. Detached: the hook does not wait, and the
+/// dialog's stdio is not apt's, so apt is never held open by it.
+fn offer_allow_dialog(threats: &[&PackageVerdict]) {
+    let Some(sess) = session::resolve_active_graphical() else { return };
+    for p in threats.iter().take(3) {
+        let Some(sha) = p.sha256.as_deref() else { continue };
+        let _ = Command::new("ghost-sentri")
+            .arg("--blocked")
+            .arg(sha)
+            .arg(p.threat.as_deref().unwrap_or("threat"))
+            .arg(if p.version.is_empty() { p.name.clone() } else { format!("{} {}", p.name, p.version) })
+            .uid(sess.uid)
+            .gid(sess.gid)
+            .env_clear()
+            .env("HOME", &sess.home)
+            .env("USER", &sess.user)
+            .env("LOGNAME", &sess.user)
+            .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            .envs(sess.env.iter().cloned())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn();
+    }
 }
 
 fn open_tty() -> Option<std::fs::File> {
